@@ -1,9 +1,9 @@
 scala/scala/project/target/*
 .idea
 scala/scala/target/*
-benchmark_data/benchmark/.ipynb_checkpoints
+benchmark/benchmark/.ipynb_checkpoints
 scala/scala/output/
 scala/scala/project/project/
-benchmark_data/benchmark/output
-benchmark_data/benchmark/stats-queries/.ipynb_checkpoints
-benchmark_data/benchmark/rewrite-assembly-0.1.0-SNAPSHOT.jar
+benchmark/benchmark/output
+benchmark/benchmark/stats-queries/.ipynb_checkpoints
+benchmark/benchmark/rewrite-assembly-0.1.0-SNAPSHOT.jar
