@@ -4,8 +4,16 @@ ThisBuild / scalaVersion := "2.13.13"
 
 lazy val root = (project in file("."))
   .settings(
-    name := "scala"
+    name := "rewrite",
+    assembly / mainClass := Some("QueryPlan")
   )
+
+mainClass in Compile := Some("QueryPlan")
+
+assemblyMergeStrategy in assembly := {
+  case PathList("META-INF", _*) => MergeStrategy.discard
+  case _                        => MergeStrategy.first
+}
 
 // https://mvnrepository.com/artifact/org.apache.spark/spark-sql
 libraryDependencies += "org.apache.spark" %% "spark-sql" % "3.5.1"

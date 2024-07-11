@@ -32,38 +32,6 @@ import upickle.default._
 import java.nio.file.{Files, Paths}
 import java.io.PrintWriter
 
-//import java.net.URL
-//import org.apache.calcite.sql.dialect.PostgresqlSqlDialect
-//import org.apache.calcite.config.{CalciteConnectionConfig, CalciteSystemProperty}
-//import org.apache.calcite.plan.hep.HepProgram
-//import org.apache.calcite.rel.RelRoot
-//import org.apache.calcite.schema.SchemaPlus
-//import org.apache.calcite.sql.SqlNode
-//import org.apache.calcite.sql.parser.SqlParseException
-//import org.apache.calcite.sql.parser.impl.SqlParserImpl
-//import org.apache.calcite.sql.util.SqlString
-//import org.apache.calcite.tools.FrameworkConfig
-//import org.apache.calcite.tools.ValidationException
-//import org.apache.calcite.rel.core.{Filter, Project, TableScan}
-//import org.apache.calcite.rel.metadata.RelMetadataQuery
-//import org.apache.calcite.rex.RexNode
-//import org.apache.calcite.rex.RexCall
-//import org.apache.calcite.plan.TableAccessMap
-//import org.apache.calcite.rel.RelVisitor
-//import org.apache.calcite.rel.core.JoinRelType
-//import org.apache.calcite.rel.core.EquiJoin
-//import org.apache.calcite.rel.hint.RelHint
-//import org.apache.spark.internal.Logging
-//import org.apache.spark.sql.catalyst.dsl.expressions.DslExpression
-//import org.apache.spark.sql.catalyst.expressions._
-//import org.apache.spark.sql.catalyst.expressions.aggregate._
-//import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftSemi}
-//import org.apache.spark.sql.catalyst.plans.logical._
-//import org.apache.spark.sql.catalyst.rules.Rule
-//import org.apache.spark.sql.catalyst.trees.TreePattern
-//import org.apache.spark.sql.types._
-//import org.apache.spark.sql.types.DecimalType.DoubleDecimal
-//import java.io.File
 
 case class JsonOutput(original_query: String, rewritten_query: List[String], features: String, time: Double)
 object JsonOutput {
@@ -77,18 +45,27 @@ object QueryPlan {
 
     Class.forName("org.apache.calcite.jdbc.Driver")
     // use the schema information and file locations specified in model.json
-    val info = new Properties
-    info.put("model", "model.json")
+    // val info = new Properties
+    // info.put("model", "model.json")
 
     // connect to the postgresql database
-    val connection = DriverManager.getConnection("jdbc:calcite:", info)
+    val connection = DriverManager.getConnection("jdbc:calcite:")
+    // val connection = DriverManager.getConnection("jdbc:calcite:", info)
     val calciteConnection = connection.unwrap(classOf[CalciteConnection])
     val rootSchema = calciteConnection.getRootSchema
-    val ds = JdbcSchema.dataSource("jdbc:postgresql://localhost:5432/multidb", "org.postgresql.Driver", "postgres", "postgres")
-    rootSchema.add("MULTIDB", JdbcSchema.create(rootSchema, "MULTIDB", ds, null, null))
+    val jdbcUrl = args(1)
+    val schemaName = args(2)
+    val jdbcUser = args(3)
+    val jdbcPassword = args(4)
+    // val ds = JdbcSchema.dataSource("jdbc:postgresql://localhost:5432/stats", "org.postgresql.Driver", "stats", "stats")
+    val ds = JdbcSchema.dataSource(jdbcUrl, "org.postgresql.Driver", jdbcUser, jdbcPassword)
+    rootSchema.add(schemaName, JdbcSchema.create(rootSchema, schemaName, ds, null, null))
 
+    val outputDir = "output"
+
+    print(rootSchema)
     // build a framework for the schema the query corresponds to
-    val subSchema = rootSchema.getSubSchema(args(1))
+    val subSchema = rootSchema.getSubSchema(schemaName)
     val parserConfig = SqlParser.Config.DEFAULT.withCaseSensitive(false)
     val config = Frameworks.newConfigBuilder
       .defaultSchema(subSchema)
@@ -215,7 +192,7 @@ object QueryPlan {
           var resultString = ""
           var dropString = ""
           val stringOutput = root.BottomUp(indexToName, resultString, dropString)
-          val stringForJson = stringOutput._2.replace(args(1) + ".", "")
+          val stringForJson = stringOutput._2.replace(schemaName + ".", "")
           val listForJson = stringForJson.split("\n").toList
 
           // add the aggregate to the last CREATE
@@ -238,7 +215,7 @@ object QueryPlan {
           val executionTime = (endTime - startTime) / 1e9
 
           /// for the column Date, we needed \\\"Date\\\" for this scala, but now we want Date again
-          val original = args(0).replace("\"Date\"", "Date")
+          val original = query.replace("\"Date\"", "Date")
 
           // GET FEATURES OF THE JOIN TREE
           // get the tree depth
@@ -257,10 +234,13 @@ object QueryPlan {
           // save all features in one list
           var features = List(treeDepth, containerCounts, branchingFactors, balancednessFactor).toString
 
+          val resultsDir = "output"
+          Files.createDirectories(Paths.get(resultsDir))
+
           // write a txt file with a visulization of the join tree
           println(root.treeToString(0))
-          val filePathJoinTree = "/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
-            args(1) + "_" + args(2) + "_jointree.txt"
+          val filePathJoinTree = // "/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
+            resultsDir + "/jointree.txt"
           val writer = new PrintWriter(filePathJoinTree)
           writer.println(root.treeToString(0))
           writer.close()
@@ -280,10 +260,11 @@ object QueryPlan {
           }
           println("hypergraph representation: " + edgeStart + " " + edgeResult.toString)
           // write a txt file with the edges and the number of vertices of the hypergraph
-          val filePathHypergraph = "/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
-            args(1) + "_" + args(2) + "_hypergraph.txt"
+          val filePathHypergraph = // "/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
+            resultsDir + "/hypergraph.txt"
           val writer1 = new PrintWriter(filePathHypergraph)
-          writer1.println(edgeStart + " " + edgeResult.toString)
+          writer1.println(hg.toString)
+//          writer1.print()
           writer1.close()
 
 
@@ -291,16 +272,16 @@ object QueryPlan {
           val jsonOutput = JsonOutput(original, finalList, features, executionTime)
           val json: String = write(jsonOutput)
           println(json)
-          val filePath = "/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
-            args(1) + "_" + args(2) + "_output.json"
+          val filePath = //"/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
+            resultsDir + "/output.json"
           Files.write(Paths.get(filePath), json.getBytes)
 
           // write a file, which makes dropping the tables after creating them easy
           val listDrop = stringOutput._3.split("\n").toList
           val jsonOutputDrop = JsonOutput("", listDrop, "", 0)
           val jsonDrop: String = write(jsonOutputDrop)
-          val filePathDrop = "/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
-            args(1) + "_" + args(2) + "_drop.json"
+          val filePathDrop = //"/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
+            resultsDir + "/drop.json"
           Files.write(Paths.get(filePathDrop), jsonDrop.getBytes)
         }
       }
@@ -576,6 +557,7 @@ object QueryPlan {
             e.planReference.getTable.getQualifiedName
           case e if e.planReference.isInstanceOf[LogicalFilter] =>
             e.planReference.getInputs.get(0).getTable.getQualifiedName
+          case _ => "_"
         }}] [[parent: ${parent != null}]]
            |${children.map(c => c.treeToString(level + 1)).mkString("\n")}""".stripMargin
     }
@@ -734,6 +716,9 @@ object QueryPlan {
       }
       root
     }
-  }
 
+    override def toString: String = {
+      edges.map(e => e.name + "(" + e.vertices.mkString(",") + ")").mkString("\n")
+    }
+  }
 }
