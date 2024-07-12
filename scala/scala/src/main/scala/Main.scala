@@ -33,7 +33,8 @@ import java.nio.file.{Files, Paths}
 import java.io.PrintWriter
 
 
-case class JsonOutput(original_query: String, rewritten_query: List[String], features: String, time: Double)
+case class JsonOutput(original_query: String, rewritten_query: List[String],
+                      features: String, time: Double, acyclic: Boolean)
 object JsonOutput {
   implicit val rw: ReadWriter[JsonOutput] = macroRW
 }
@@ -133,29 +134,30 @@ object QueryPlan {
     // calculate the join tree
     val jointree = hg.flatGYO
 
+    val resultsDir = "output"
+    Files.createDirectories(Paths.get(resultsDir))
+
+    def writeResults(fileName: String, content: String) = {
+      val filePath = resultsDir + "/" + fileName
+      val filewriter = new PrintWriter(filePath)
+      filewriter.print(content)
+      filewriter.close()
+    }
+
+    writeResults("hypergraph.txt", hg.toString)
+
     // there is no jointree, the query is cyclic
     if (jointree == null) {
       println("join is cyclic")
+      val jsonOutput = JsonOutput(query, null, null, 0, false)
+      val json: String = write(jsonOutput)
+      writeResults("output.json", json.toString)
     }
     else {
       // First check if there is a single tree node, i.e., relation that contains all attributes
       // contained in the aggregate functions -> Query 0MA
       if (aggAttributes.isEmpty){
         println("query has no attributes")
-
-        /*
-        // Get the output strings for the Bottom Up traversal
-        var resultString = ""
-        val stringOutput = jointree.BottomUp(indexToName, resultString)
-        val stringForJson = stringOutput._2.replace(args(1) + ".", "")
-        //val listForJson = stringForJson.split("\n").map(row => s"\"\"\"$row\"\"\"").toList
-        val listForJson = stringForJson.split("\n").toList
-        val jsonOutput = JsonOutput(args(0), listForJson, "")
-        val json: String = write(jsonOutput)
-        println(json)
-        val filePath = "output.json"
-        Files.write(Paths.get(filePath), json.getBytes)
-        */
       }
       else {
         val findNodeContainingAttributes = jointree.findNodeContainingAttributes(aggAttributes)
@@ -234,16 +236,11 @@ object QueryPlan {
           // save all features in one list
           var features = List(treeDepth, containerCounts, branchingFactors, balancednessFactor).toString
 
-          val resultsDir = "output"
-          Files.createDirectories(Paths.get(resultsDir))
+
 
           // write a txt file with a visulization of the join tree
           println(root.treeToString(0))
-          val filePathJoinTree = // "/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
-            resultsDir + "/jointree.txt"
-          val writer = new PrintWriter(filePathJoinTree)
-          writer.println(root.treeToString(0))
-          writer.close()
+          writeResults("jointree.txt", root.treeToString(0))
 
           // GET THE HYPERGRAPH REPRESENTATION
           var edgeStart = 0
@@ -260,29 +257,20 @@ object QueryPlan {
           }
           println("hypergraph representation: " + edgeStart + " " + edgeResult.toString)
           // write a txt file with the edges and the number of vertices of the hypergraph
-          val filePathHypergraph = // "/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
-            resultsDir + "/hypergraph.txt"
-          val writer1 = new PrintWriter(filePathHypergraph)
-          writer1.println(hg.toString)
-//          writer1.print()
-          writer1.close()
+
 
 
           // write a json file with the original and the rewritten query
-          val jsonOutput = JsonOutput(original, finalList, features, executionTime)
+
+          val jsonOutput = JsonOutput(original, finalList, features, executionTime, true)
           val json: String = write(jsonOutput)
-          println(json)
-          val filePath = //"/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
-            resultsDir + "/output.json"
-          Files.write(Paths.get(filePath), json.getBytes)
+          writeResults("output.json", json.toString)
 
           // write a file, which makes dropping the tables after creating them easy
           val listDrop = stringOutput._3.split("\n").toList
-          val jsonOutputDrop = JsonOutput("", listDrop, "", 0)
+          val jsonOutputDrop = JsonOutput("", listDrop, "", 0, true)
           val jsonDrop: String = write(jsonOutputDrop)
-          val filePathDrop = //"/home/dani/masterarbeit/benchmark_data/benchmark/rewritten/" +
-            resultsDir + "/drop.json"
-          Files.write(Paths.get(filePathDrop), jsonDrop.getBytes)
+          writeResults("drop.json", jsonDrop.toString)
         }
       }
     }
@@ -718,7 +706,7 @@ object QueryPlan {
     }
 
     override def toString: String = {
-      edges.map(e => e.name + "(" + e.vertices.mkString(",") + ")").mkString("\n")
+      edges.map(e => e.name + "(" + e.vertices.map(v => v.toString.replace("$", "")).mkString(",") + ")").mkString("\n")
     }
   }
 }

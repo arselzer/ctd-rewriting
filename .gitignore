@@ -7,3 +7,6 @@ scala/scala/project/project/
 benchmark/benchmark/output
 benchmark/benchmark/stats-queries/.ipynb_checkpoints
 benchmark/benchmark/rewrite-assembly-0.1.0-SNAPSHOT.jar
+benchmark/benchmark/lsqb/data
+benchmark/benchmark/lsqb/sql/.ipynb_checkpoints
+benchmark/benchmark/ctdPython/.ipynb_checkpoints
