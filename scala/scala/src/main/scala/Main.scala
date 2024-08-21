@@ -17,7 +17,7 @@ import org.apache.calcite.rex._
 import org.apache.calcite.sql.dialect.Db2SqlDialect
 import org.apache.calcite.sql.parser.SqlParser
 import org.apache.calcite.sql.SqlKind
-import org.apache.calcite.tools.{Frameworks, Planner, RelBuilder, RelBuilderFactory}
+import org.apache.calcite.tools.{FrameworkConfig, Frameworks, Planner, RelBuilder, RelBuilderFactory}
 
 import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
@@ -28,17 +28,19 @@ import upickle.default._
 import java.nio.file.{Files, Paths}
 import java.io.PrintWriter
 import py4j.GatewayServer
+import upickle.core.Types
 
 case class JsonOutput(original_query: String, rewritten_query: List[String],
                       features: String, time: Double, acyclic: Boolean)
+
 object JsonOutput {
   implicit val rw: ReadWriter[JsonOutput] = macroRW
 }
 
 object QueryRewriter {
-  private var planner: Option[Planner] = None
-
   // The state after hypergraph extraction is needed for creating the final output
+  private var frameworkConfig: FrameworkConfig = null
+  private var planner: Planner = null
   private var schemaName: String = null
   private var hg: Hypergraph = null
   private var aggAttributes: Seq[RexNode] = null
@@ -65,12 +67,11 @@ object QueryRewriter {
     // build a framework for the schema the query corresponds to
     val subSchema = rootSchema.getSubSchema(schemaName)
     val parserConfig = SqlParser.Config.DEFAULT.withCaseSensitive(false)
-    val config = Frameworks.newConfigBuilder
+    frameworkConfig = Frameworks.newConfigBuilder
       .defaultSchema(subSchema)
       .parserConfig(parserConfig)
       .build
 
-    planner = Option(Frameworks.getPlanner(config))
     this.schemaName = schemaName
   }
 
@@ -104,13 +105,13 @@ object QueryRewriter {
   }
 
   def getHypergraph(query: String): Hypergraph = {
-    assert(planner.nonEmpty)
+    planner = Frameworks.getPlanner(frameworkConfig)
 
-    val sqlNode = planner.get.parse(query)
-    val validatedSqlNode = planner.get.validate(sqlNode)
+    val sqlNode = planner.parse(query)
+    val validatedSqlNode = planner.validate(sqlNode)
 
     // get the logical query plan
-    val relRoot = planner.get.rel(validatedSqlNode)
+    val relRoot = planner.rel(validatedSqlNode)
     val relNode = relRoot.project
 
     // push the filters in the logical query plan down
@@ -162,9 +163,47 @@ object QueryRewriter {
     // build the hypergraph
     hg = new Hypergraph(items, conditions, attributes)
 
-    return hg
+    hg
   }
 
+  case class JSONEdge(name: String, vertices: List[String])
+  case class JSONNode(bag: List[String], cover: List[JSONEdge], children: List[JSONNode])
+
+  implicit val edgeRw: ReadWriter[JSONEdge] = macroRW
+  implicit val nodeRw: ReadWriter[JSONNode] = macroRW
+
+  def hdStringToHTNode(hdJSON: String): HTNode = {
+    def jsonNodeToHTNode(jsonNode: JSONNode): HTNode = {
+      jsonNode match {
+        case JSONNode(bag, cover, children) => {
+          val edges = cover.map(jsonEdge => hg.getEdgeByName(jsonEdge.name).get).toSet
+          val childNodes = children.map(jsonNodeToHTNode).toSet
+
+          new HTNode(edges, childNodes, null)
+        }
+      }
+    }
+
+    val jsonNode = read[JSONNode](hdJSON)
+    jsonNodeToHTNode(jsonNode)
+  }
+
+  def rewriteCyclicJSON(hdJSON: String): String = {
+    val ht = hdStringToHTNode(hdJSON)
+
+    rewriteCyclic(ht)
+    return ht.treeToString()
+  }
+
+  def rewriteCyclic(ht: HTNode): Unit = {
+
+  }
+
+  /**
+   * If the query is acyclic, constructs a Yannakakis rewriting.
+   * If the query is cyclic, writes out the hypergraph
+   * @param query - SQL query string
+   */
   def rewrite(query: String): Unit = {
     val startTime = System.nanoTime()
 
@@ -372,221 +411,4 @@ object QueryRewriter {
     }
   }
 
-  // define a class for hypergraph edges
-  class HGEdge(val vertices: Set[RexNode], var name: String, var nameJoin: String, val planReference: RelNode,
-               val attributeToVertex: mutable.Map[RexNode, RexNode], val attIndex: Int,
-               val attributes: Seq[RexNode]){
-
-    // get a map between the vertices and attributes
-    val vertexToAttribute = HashMap[RexNode, RexNode]()
-    val planReferenceAttributes = planReference.getRowType.getFieldList
-    planReferenceAttributes.forEach { case att =>
-      var index = att.getIndex + attIndex
-      var key = attributes(index)
-      val keyString = attributeToVertex.getOrElse(key, null)
-      val valueString = key
-      if (keyString != null) vertexToAttribute.put(keyString, valueString)
-    }
-    //println("vertexToAttribute: " + vertexToAttribute)
-
-    // check if the vertices of an edge occur in the vertices of another edge
-    def contains(other: HGEdge): Boolean = {
-      other.vertices subsetOf vertices
-    }
-
-    // check if the vertices of two edges are different
-    def containsNotEqual(other: HGEdge): Boolean = {
-      contains(other) && !(vertices subsetOf other.vertices)
-    }
-
-    def copy(newVertices: Set[RexNode] = vertices,
-             newName: String = name,
-             newPlanReference: RelNode = planReference): HGEdge =
-      new HGEdge(newVertices, newName, newName, newPlanReference, attributeToVertex, attIndex, attributes)
-
-    override def toString: String = s"""${name}(${vertices.mkString(", ")})"""
-  }
-
-  // define a class for hypertree nodes
-  class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNode){
-
-    // get the SQL statements of the bottom up traversal
-    def BottomUp(indexToName: scala.collection.immutable.Map[RexInputRef, String], resultString: String,
-                 dropString: String): (RelNode, String, String) = {
-      val edge = edges.head
-      val scanPlan = edge.planReference
-      val vertices = edge.vertices
-      var prevJoin: RelNode = scanPlan
-
-      // create the filtered single tables
-      val dialect = Db2SqlDialect.DEFAULT
-      val relToSqlConverter = new RelToSqlConverter(dialect)
-      val res = relToSqlConverter.visitRoot(scanPlan)
-      val sqlNode1 = res.asQueryOrValues()
-      var result = sqlNode1.toSqlString(dialect, false).getSql()
-      result = "CREATE VIEW " + edge.name + " AS " + result
-      var resultString1 = resultString + result.replace("\n", " ") + "\n"
-      var dropString1 = "DROP VIEW " + edge.name + "\n" + dropString
-
-      // create semi joins with all children
-      for (c <- children) {
-        val childEdge = c.edges.head
-        val childVertices = childEdge.vertices
-        val overlappingVertices = vertices.intersect(childVertices)
-
-        val cStringOutput = c.BottomUp(indexToName, resultString1, dropString1)
-        resultString1 = cStringOutput._2
-        dropString1 = cStringOutput._3
-        val newName = edge.nameJoin + childEdge.nameJoin
-        var result1 = "CREATE UNLOGGED TABLE " + newName + " AS SELECT * FROM " + edge.nameJoin +
-          " WHERE EXISTS (SELECT 1 FROM " + childEdge.nameJoin + " WHERE "
-        val joinConditions = overlappingVertices.map { vertex =>
-          val att1 = edge.vertexToAttribute(vertex)
-          val att2 = childEdge.vertexToAttribute(vertex)
-          val att1_name = indexToName.getOrElse(att1.asInstanceOf[RexInputRef], "")
-          val att2_name = indexToName.getOrElse(att2.asInstanceOf[RexInputRef], "")
-          result1 = result1 + edge.nameJoin + "." + att1_name + "=" + childEdge.nameJoin + "." + att2_name + " AND "
-        }
-        result1 = result1.dropRight(5) + ")"
-        resultString1 = resultString1 + result1 + "\n"
-        dropString1 = "DROP TABLE " + newName + "\n" + dropString1
-        edge.nameJoin = newName
-        childEdge.nameJoin = newName
-      }
-      (prevJoin, resultString1, dropString1)
-    }
-
-    // define a given root as the new root of the tree
-    def reroot: HTNode = {
-      if (parent == null) {
-        this
-      } else {
-        var current = this
-        var newCurrent = this.copy(newParent = null)
-        val root = newCurrent
-        while (current.parent != null) {
-          val p = current.parent
-          val newChild = p.copy(newChildren = p.children - current, newParent = null)
-          newCurrent.children += newChild
-          current = p
-          newCurrent = newChild
-        }
-        root.setParentReferences
-        root
-      }
-    }
-
-    // check if there is a node containing all aggregation attributes (and find it)
-    def findNodeContainingAttributes(aggAttributes: Seq[RexNode]): (HTNode, Seq[RexNode]) = {
-      var aggAtt = Seq[RexNode]()
-      var nodeAtt = List[RexNode]()
-
-      // get the node attributes and the agg attributes, with the same mappings
-      val e = edges.head
-      val nodeAttributes = e.planReference.getRowType.getFieldList
-      nodeAttributes.forEach { case x =>
-        var index = x.getIndex + e.attIndex
-        var key = e.attributes(index)
-        nodeAtt = nodeAtt :+ e.attributeToVertex.getOrElse(key, key)
-      }
-      aggAtt = aggAttributes.map(key => e.attributeToVertex.getOrElse(key, key))
-
-      // Check if all aggregates are present in this node
-      val allInSet = aggAtt.forall(nodeAtt.contains)
-
-      if (allInSet) {
-        println("All elements are present in " + this)
-        aggAtt = aggAtt.map{a => edges.head.vertexToAttribute.getOrElse(a,a)}
-        (this, aggAtt)
-      } else {
-        for (c <- children) {
-          val node = c.findNodeContainingAttributes(aggAttributes)
-          if (node != null) {
-            return node
-          }
-        }
-        null
-      }
-    }
-
-    // set references between child-parent relationships in the tree
-    def setParentReferences: Unit = {
-      for (c <- children) {
-        c.parent = this
-        c.setParentReferences
-      }
-    }
-
-    // get the join tree's depth
-    def getTreeDepth(root: HTNode, depth: Int): Int = {
-      if (root.children.isEmpty) {
-        depth
-      } else {
-        root.children.map(c => getTreeDepth(c, depth + 1)).max
-      }
-    }
-
-    // get a list of the item lifetimes of all attributes in the join tree
-    def getContainerCount(equivalenceClasses: Set[Set[RexNode]], attributes: Seq[RexNode]): List[Int] = {
-      // number of the items, which occure several times, are those being joined on
-      // how often they appear can be retrived of the size of their equivalence class
-      var containerCount = equivalenceClasses.map(_.size).toList
-      // the number of attributes only occuring once, are the number of all attribute minus
-        // the attributes occuring more often
-      val occuringOnce = attributes.size - containerCount.sum
-      val occuringOnceList = List.fill(occuringOnce)(1)
-      containerCount = occuringOnceList ::: containerCount
-      containerCount.sorted
-    }
-
-    // get the branching factors of the join tree
-    def getBranchingFactors(root: HTNode): List[Int] = {
-      if (root.children.isEmpty) {
-        List.empty[Int]
-      } else {
-        var sizes = List.empty[Int]
-        for (child <- root.children) {
-          sizes = sizes ++ getBranchingFactors(child)
-        }
-        sizes ::: List(root.children.size)
-      }
-    }
-
-    // get the balancedness factor of the join tree
-    def getBalancednessFactors(root: HTNode): (Int, List[Double]) = {
-      if (root.children.isEmpty){
-        return (0, List.empty[Double])
-      } else if (root.children.size == 1){
-        val balanceOneChild = getBalancednessFactors(root.children.head)
-        return (balanceOneChild._1, balanceOneChild._2)
-      } else {
-        val childrenResults = root.children.toList.map(c => getBalancednessFactors(c))
-        val firstElements = childrenResults.map(_._1).map(_ + 1)
-        val secondElements = childrenResults.map(_._2)
-        val combinedSecondElements = secondElements.flatten
-        val elementsCount = firstElements.sum
-        val balancedness = firstElements.min.toDouble / firstElements.max
-        return (elementsCount, combinedSecondElements ::: List(balancedness))
-      }
-    }
-
-    def copy(newEdges: Set[HGEdge] = edges, newChildren: Set[HTNode] = children,
-             newParent: HTNode = parent): HTNode =
-      new HTNode(newEdges, newChildren, newParent)
-
-    // define a function to be able to print the join tree
-    def treeToString(level: Int = 0): String = {
-      s"""${"-- ".repeat(level)}TreeNode(${edges})""" +
-        s"""[${edges.map {
-          case e if e.planReference.isInstanceOf[LogicalTableScan] =>
-            e.planReference.getTable.getQualifiedName
-          case e if e.planReference.isInstanceOf[LogicalFilter] =>
-            e.planReference.getInputs.get(0).getTable.getQualifiedName
-          case _ => "_"
-        }}] [[parent: ${parent != null}]]
-           |${children.map(c => c.treeToString(level + 1)).mkString("\n")}""".stripMargin
-    }
-
-    //override def toString: String = toString(0)
-  }
 }

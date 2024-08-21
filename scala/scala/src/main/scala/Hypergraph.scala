@@ -1,4 +1,3 @@
-import QueryRewriter.{HGEdge, HTNode}
 import org.apache.calcite.rel.RelNode
 import org.apache.calcite.rex.{RexCall, RexNode}
 import org.apache.calcite.sql.fun.SqlStdOperatorTable
@@ -156,6 +155,10 @@ class Hypergraph(private val items: Seq[RelNode], private val conditions: Seq[Re
       }
       root
     }
+
+  def getEdgeByName(name: String): Option[HGEdge] = {
+    return edges.find(e => e.name equals name)
+  }
 
     override def toString: String = {
       edges.map(e => e.name + "(" + e.vertices.map(v => v.toString.replace("$", "")).mkString(",") + ")").mkString("\n")
