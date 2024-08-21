@@ -5,10 +5,10 @@ ThisBuild / scalaVersion := "2.13.13"
 lazy val root = (project in file("."))
   .settings(
     name := "rewrite",
-    assembly / mainClass := Some("QueryPlan")
+    assembly / mainClass := Some("QueryRewriter")
   )
 
-mainClass in Compile := Some("QueryPlan")
+mainClass in Compile := Some("QueryRewriter")
 
 assemblyMergeStrategy in assembly := {
   case PathList("META-INF", _*) => MergeStrategy.discard

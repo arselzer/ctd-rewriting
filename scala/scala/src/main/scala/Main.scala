@@ -1,6 +1,5 @@
 import java.sql.{Connection, DriverManager}
 import java.util.Properties
-
 import org.apache.calcite.adapter.jdbc.JdbcSchema
 import org.apache.calcite.jdbc.CalciteConnection
 import org.apache.calcite.plan.RelOptUtil
@@ -16,22 +15,19 @@ import org.apache.calcite.rel.RelNode
 import org.apache.calcite.rel.rules.FilterJoinRule
 import org.apache.calcite.rex._
 import org.apache.calcite.sql.dialect.Db2SqlDialect
-import org.apache.calcite.sql.fun.SqlStdOperatorTable
 import org.apache.calcite.sql.parser.SqlParser
 import org.apache.calcite.sql.SqlKind
-import org.apache.calcite.tools.Frameworks
-import org.apache.calcite.tools.RelBuilder
-import org.apache.calcite.tools.RelBuilderFactory
+import org.apache.calcite.tools.{Frameworks, Planner, RelBuilder, RelBuilderFactory}
 
 import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
 import scala.jdk.CollectionConverters._
 import scala.collection.mutable.HashMap
-
 import upickle.default._
+
 import java.nio.file.{Files, Paths}
 import java.io.PrintWriter
-
+import py4j.GatewayServer
 
 case class JsonOutput(original_query: String, rewritten_query: List[String],
                       features: String, time: Double, acyclic: Boolean)
@@ -39,25 +35,26 @@ object JsonOutput {
   implicit val rw: ReadWriter[JsonOutput] = macroRW
 }
 
-object QueryPlan {
-  def main(args: Array[String]): Unit = {
-    // stop the time for the whole program
-    val startTime = System.nanoTime()
+object QueryRewriter {
+  private var planner: Option[Planner] = None
 
-    Class.forName("org.apache.calcite.jdbc.Driver")
-    // use the schema information and file locations specified in model.json
-    // val info = new Properties
-    // info.put("model", "model.json")
+  // The state after hypergraph extraction is needed for creating the final output
+  private var schemaName: String = null
+  private var hg: Hypergraph = null
+  private var aggAttributes: Seq[RexNode] = null
+  private var indexToName: Map[RexInputRef, String] = null
+  private var relNodeFiltered: RelNode = null
+  private var attributes: Seq[RexInputRef] = null
+  private var items: Seq[RelNode] = null
 
+  private val gatewayServer: GatewayServer = new GatewayServer(this)
+
+  def connect(jdbcUrl: String, schemaName: String, jdbcUser: String, jdbcPassword: String): Unit = {
     // connect to the postgresql database
     val connection = DriverManager.getConnection("jdbc:calcite:")
     // val connection = DriverManager.getConnection("jdbc:calcite:", info)
     val calciteConnection = connection.unwrap(classOf[CalciteConnection])
     val rootSchema = calciteConnection.getRootSchema
-    val jdbcUrl = args(1)
-    val schemaName = args(2)
-    val jdbcUser = args(3)
-    val jdbcPassword = args(4)
     // val ds = JdbcSchema.dataSource("jdbc:postgresql://localhost:5432/stats", "org.postgresql.Driver", "stats", "stats")
     val ds = JdbcSchema.dataSource(jdbcUrl, "org.postgresql.Driver", jdbcUser, jdbcPassword)
     rootSchema.add(schemaName, JdbcSchema.create(rootSchema, schemaName, ds, null, null))
@@ -73,18 +70,51 @@ object QueryPlan {
       .parserConfig(parserConfig)
       .build
 
-    val planner = Frameworks.getPlanner(config)
-    // get and parse the SQL input statement
-    val query = args(0)
-    val sqlNode = planner.parse(query)
-    val validatedSqlNode = planner.validate(sqlNode)
+    planner = Option(Frameworks.getPlanner(config))
+    this.schemaName = schemaName
+  }
+
+  def main(args: Array[String]): Unit = {
+    Class.forName("org.apache.calcite.jdbc.Driver")
+    // use the schema information and file locations specified in model.json
+    // val info = new Properties
+    // info.put("model", "model.json")
+
+
+    if (args.length >= 4) {
+      val jdbcUrl = args(0)
+      val schemaName = args(1)
+      val jdbcUser = args(2)
+      val jdbcPassword = args(3)
+
+      connect(jdbcUrl, schemaName, jdbcUser, jdbcPassword)
+
+      if (args.length == 5) {
+        val query = args(4)
+        rewrite(query)
+      }
+    }
+
+    gatewayServer.start
+    println("Py4j server started")
+  }
+
+  def stopServer(): Unit = {
+    gatewayServer.shutdown()
+  }
+
+  def getHypergraph(query: String): Hypergraph = {
+    assert(planner.nonEmpty)
+
+    val sqlNode = planner.get.parse(query)
+    val validatedSqlNode = planner.get.validate(sqlNode)
 
     // get the logical query plan
-    val relRoot = planner.rel(validatedSqlNode)
+    val relRoot = planner.get.rel(validatedSqlNode)
     val relNode = relRoot.project
 
     // push the filters in the logical query plan down
-    val relNodeFiltered = decorrelate(relNode)
+    relNodeFiltered = pushDownFilters(relNode)
     // print the logical query plan as string
     val relNodeString = RelOptUtil.toString(relNodeFiltered)
     println(relNodeString)
@@ -93,11 +123,11 @@ object QueryPlan {
     val att = mutable.Set[RexInputRef]()
     extractInputRefsRecursive(relNode, att)
     att.toSet
-    val attributes: Seq[RexInputRef] = att.toSeq
+    attributes = att.toSeq
     println("attributes: " + attributes)
 
     // get the aggregation attributes
-    var aggAttributes: Seq[RexNode] = relNodeFiltered match {
+    aggAttributes = relNodeFiltered match {
       case aggregate: LogicalAggregate =>
         val input = aggregate.getInput
         val aggCalls = aggregate.getAggCallList.asScala
@@ -117,6 +147,7 @@ object QueryPlan {
 
     // extract all items and conditions of the joins in the logical plan
     val (items, conditions) = extractInnerJoins(relNodeFiltered)
+    this.items = items
     //println("items: " + items)
     println("conditions: " + conditions)
 
@@ -125,11 +156,19 @@ object QueryPlan {
       val fieldNames = i.getRowType().getFieldNames().asScala.toList
       fieldNames
     }
-    val indexToName = attributes.zip(names).toMap
+    indexToName = attributes.zip(names).toMap
     //println("indexToName: " + indexToName)
 
     // build the hypergraph
-    val hg = new Hypergraph(items, conditions, attributes)
+    hg = new Hypergraph(items, conditions, attributes)
+
+    return hg
+  }
+
+  def rewrite(query: String): Unit = {
+    val startTime = System.nanoTime()
+
+    getHypergraph(query)
 
     // calculate the join tree
     val jointree = hg.flatGYO
@@ -258,8 +297,6 @@ object QueryPlan {
           println("hypergraph representation: " + edgeStart + " " + edgeResult.toString)
           // write a txt file with the edges and the number of vertices of the hypergraph
 
-
-
           // write a json file with the original and the rewritten query
 
           val jsonOutput = JsonOutput(original, finalList, features, executionTime, true)
@@ -277,7 +314,7 @@ object QueryPlan {
   }
 
   // define the function, which pushes the filters down
-  private def decorrelate(root: RelNode): RelNode = {
+  private def pushDownFilters(root: RelNode): RelNode = {
     val f: RelBuilderFactory = RelBuilder.proto()
     val programBuilder = new HepProgramBuilder
     programBuilder.addRuleInstance(new FilterJoinRule.FilterIntoJoinRule(true, f, FilterJoinRule.TRUE_PREDICATE))
@@ -551,162 +588,5 @@ object QueryPlan {
     }
 
     //override def toString: String = toString(0)
-  }
-
-  // define a hypergraph class
-  class Hypergraph(private val items: Seq[RelNode], private val conditions: Seq[RexNode],
-                   private val attributes: Seq[RexNode]){
-                   //private val att_map: HashMap[String, String]) {
-    private val vertices: mutable.Set[RexNode] = mutable.Set.empty
-    private val edges: mutable.Set[HGEdge] = mutable.Set.empty
-    private val attributeToVertex: mutable.Map[RexNode, RexNode] = mutable.Map.empty
-    private var equivalenceClasses: Set[Set[RexNode]] = Set.empty
-
-    // add all equality conditions to the equivalence classes
-    for (cond <- conditions) {
-      cond match {
-        case call: RexCall if call.getOperator == SqlStdOperatorTable.EQUALS =>
-          val operands = call.getOperands.asScala.toList
-          if (operands.size == 2) {
-            val lAtt = operands.head
-            val rAtt = operands(1)
-            equivalenceClasses += Set(lAtt, rAtt)
-          }
-        case _ => println("other")
-      }
-    }
-
-    // combine all pairs with common columns/attributes
-    // e.g. (col1, col2),(col1, col3),(col4,col5) -> (col1, col2, col3),(col4,col5)
-    while (combineEquivalenceClasses) {}
-    println("combined equivalence classes: " + equivalenceClasses)
-
-    // design an efficient mapping between the attributes and vertices
-    // e.g. vertexToAttributes: col1 -> (col1,col2,col3); col4 -> (col4,col5)
-    //      attributeToVertex: col1->col1, col2->col1, col3->col1, col4->col4, col5->col4
-    for (equivalenceClass <- equivalenceClasses) {
-      val attName = equivalenceClass.head
-      vertices.add(attName)
-      for (equivAtt <- equivalenceClass) {
-        attributeToVertex.put(equivAtt, attName)
-      }
-    }
-    println("attribute to vertex mapping: " + attributeToVertex)
-
-    var tableIndex = 1
-    var attIndex = 0
-    // iterate over all subtrees
-    for (item <- items) {
-      //println("join item: " + item)
-
-      // get the attributes for this subtree
-      // check if it is in the attributeToVertex list and get consistent naming
-      val projectAttributes = item.getRowType.getFieldList
-      //println("projectAttributes: " + projectAttributes)
-
-      var projectAtt = List[RexNode]()
-      projectAttributes.forEach { case x =>
-        var index = x.getIndex + attIndex
-        var key = attributes(index)
-        projectAtt = projectAtt :+ attributeToVertex.getOrElse(key, null)
-        //projectAtt = projectAtt :+ attributeToVertex.getOrElse(key, key)
-      }
-
-      // get the hyperedges (were join partners have the same name now)
-      val hyperedgeVertices = projectAtt.filter(_ != null).toSet
-      val hyperedge = new HGEdge(hyperedgeVertices, s"E${tableIndex}", s"E${tableIndex}", item, attributeToVertex, attIndex, attributes)
-      //println("hyperedge: " + hyperedge)
-      tableIndex += 1
-      attIndex += projectAttributes.size
-      //println("he: " + hyperedge + hyperedge.planReference.getTable)
-      edges.add(hyperedge)
-    }
-    println("hyperedges: " + edges)
-
-    // helper function to combine all pairs with common columns
-    private def combineEquivalenceClasses: Boolean = {
-      for (set <- equivalenceClasses) {
-        for (otherSet <- equivalenceClasses - set) {
-          if ((set intersect otherSet).nonEmpty) {
-            val unionSet = (set union otherSet)
-            equivalenceClasses -= set
-            equivalenceClasses -= otherSet
-            equivalenceClasses += unionSet
-            return true
-          }
-        }
-      }
-      false
-    }
-
-    // get the equivalence classes
-    def getEquivalenceClasses: Set[Set[RexNode]] = equivalenceClasses
-
-    // check if the query is acyclic (<=> having a join tree)
-    def isAcyclic: Boolean = {
-      flatGYO == null
-    }
-
-    // compute the join tree
-    def flatGYO: HTNode = {
-      var gyoEdges: mutable.Set[HGEdge] = mutable.Set.empty
-      var mapping: mutable.Map[String, HGEdge] = mutable.Map.empty
-      var root: HTNode = null
-      var treeNodes: mutable.Map[String, HTNode] = mutable.Map.empty
-
-      for (edge <- edges) {
-        mapping.put(edge.name, edge)
-        gyoEdges.add(edge.copy())
-      }
-      //println("mapping: " + mapping)
-      //println("GYO edges: " + gyoEdges)
-
-      var progress = true
-      while (gyoEdges.size > 1 && progress) {
-        for (e <- gyoEdges) {
-          val allOtherVertices = (gyoEdges - e).map(o => o.vertices)
-            .reduce((o1, o2) => o1 union o2)
-          val singleNodeVertices = e.vertices -- allOtherVertices
-
-          val eNew = e.copy(newVertices = e.vertices -- singleNodeVertices)
-          gyoEdges = (gyoEdges - e) + eNew
-
-        }
-
-        var nodeAdded = false
-        for (e <- gyoEdges) {
-          val supersets = gyoEdges.filter(o => o containsNotEqual e)
-
-          if (supersets.isEmpty) {
-            val containedEdges = gyoEdges.filter(o => (e contains o) && (e.name != o.name))
-            val parentNode = treeNodes.getOrElse(e.name, new HTNode(Set(e), Set(), null))
-            val childNodes = containedEdges
-              .map(c => treeNodes.getOrElse(c.name, new HTNode(Set(c), Set(), null)))
-              .toSet
-
-            parentNode.children ++= childNodes
-            if (childNodes.nonEmpty) {
-              nodeAdded = true
-            }
-
-            treeNodes.put(e.name, parentNode)
-            childNodes.foreach(c => treeNodes.put(c.edges.head.name, c))
-            root = parentNode
-            root.setParentReferences
-            gyoEdges --= containedEdges
-          }
-        }
-        if (!nodeAdded) progress = false
-      }
-
-      if (gyoEdges.size > 1) {
-        return null
-      }
-      root
-    }
-
-    override def toString: String = {
-      edges.map(e => e.name + "(" + e.vertices.map(v => v.toString.replace("$", "")).mkString(",") + ")").mkString("\n")
-    }
   }
 }

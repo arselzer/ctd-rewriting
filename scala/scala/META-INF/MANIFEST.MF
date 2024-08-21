@@ -6,5 +6,5 @@ Implementation-Title: scala
 Implementation-Version: 0.1.0-SNAPSHOT
 Implementation-Vendor: scala
 Implementation-Vendor-Id: scala
-Main-Class: QueryPlan
+Main-Class: QueryRewriter
 
