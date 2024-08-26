@@ -209,12 +209,13 @@ object QueryRewriter {
       filewriter.close()
     }
 
-    var root = ht
+    var root = ht.appendContainedEdges(hg)
+    root.setParentReferences
     var finalList: List[String] = List()
     var listDrop: List[String] = List()
 
     val startTime = System.nanoTime()
-    if (aggAttributes.isEmpty){
+    if (aggAttributes.isEmpty) {
       println("query has no agg attributes")
 
       // here we need full enumeration
@@ -254,7 +255,7 @@ object QueryRewriter {
       println("dropping " + listDrop)
     }
     else {
-      val findNodeContainingAttributes = ht.findNodeContainingAttributes(aggAttributes)
+      val findNodeContainingAttributes = root.findNodeContainingAttributes(aggAttributes)
       val nodeContainingAttributes = findNodeContainingAttributes._1
       println("nodeContaining: " + nodeContainingAttributes)
       //aggAttributes = findNodeContainingAttributes._2
@@ -290,7 +291,7 @@ object QueryRewriter {
 
         val (stringOutputEdges, dropListEdges) = createEdgeViews(projectJoinAttributes)
 
-        val (stringOutputCover, dropListCover) = createCoverJoinViews(ht, projectJoinAttributes)
+        val (stringOutputCover, dropListCover) = createCoverJoinViews(root, projectJoinAttributes)
 
         val stringOutput = root.BottomUp(indexToName, resultString, dropString, projectJoinAttributes)
         val stringForJson = stringOutput._1.replace(schemaName + ".", "")
@@ -377,8 +378,7 @@ object QueryRewriter {
   }
 
   def createCoverJoinViews(ht: HTNode, projectJoinAttributes: Set[RexNode]): (List[String], List[String]) = {
-    var dropStrings: List[String] = List()
-    ht.getAllNodes.map(node => node.getCoverJoin(indexToName))
+    ht.getAllNodes.filter(node => node.edges.size > 1).map(node => node.getCoverJoin(indexToName))
       .unzip
   }
 

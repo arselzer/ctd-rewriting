@@ -253,6 +253,15 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     }
   }
 
+  def appendContainedEdges(hg: Hypergraph): HTNode = {
+    val vertices = edges.flatMap(_.vertices)
+    val newChildren = children.map(_.appendContainedEdges(hg)) ++
+      hg.edges.filter(e => (e.vertices subsetOf vertices) && !edges.exists(e2 => e2.name.equals(e.name)))
+        .map(e => new HTNode(Set(e), Set(), null))
+    val newNode = copy(newChildren = newChildren)
+    newNode
+  }
+
   // get the join tree's depth
   def getTreeDepth(root: HTNode, depth: Int): Int = {
     if (root.children.isEmpty) {
