@@ -4,52 +4,176 @@ import org.apache.calcite.rel.rel2sql.RelToSqlConverter
 import org.apache.calcite.rex.{RexInputRef, RexNode}
 import org.apache.calcite.sql.dialect.Db2SqlDialect
 
+import scala.collection.IterableOnce.iterableOnceExtensionMethods
+
 class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNode){
+  // For each vertex, select one edge in which an attribute it maps to is contained
+  val vertexToEdge: Map[RexNode, HGEdge] = edges.flatMap(e => e.vertices)
+    .map(v => (v, edges.find(e => e.vertices.contains(v)).get)).toMap
+  val vertexToAttribute = vertexToEdge map {case (v, e) => (v, e.vertexToAttribute(v))}
+
+  def vertexName(vertex: RexNode, indexToName: scala.collection.immutable.Map[RexInputRef, String]) = {
+    vertexToEdge(vertex).name + "_" + indexToName.getOrElse(vertexToAttribute(vertex).asInstanceOf[RexInputRef], "")
+  }
+
+  def getCoverJoin(indexToName: scala.collection.immutable.Map[RexInputRef, String]): (String, String) = {
+    val edgeNames = edges.map(e => e.name)
+    val edgeNamesStr = edgeNames.toList.mkString(", ")
+    val coverJoins = edges.flatMap(e => e.vertices).map(v => {
+        val edgesContainingVariable = edges.filter(e => e.vertices.contains(v)).toList
+        if (edgesContainingVariable.isEmpty) {
+          ""
+        }
+        else {
+          edgesContainingVariable.indices.dropRight(1).map(i => {
+            val edge1 = edgesContainingVariable(i)
+            val edge2 = edgesContainingVariable(i+1)
+            val att1 = edge1.vertexToAttribute(v)
+            val att2 = edge2.vertexToAttribute(v)
+            val att1Name = indexToName.getOrElse(att1.asInstanceOf[RexInputRef], "")
+            val att2Name = indexToName.getOrElse(att2.asInstanceOf[RexInputRef], "")
+            f"${edge1.name}_$att1Name = ${edge2.name}_$att2Name"
+          }).mkString(" AND ")
+        }
+      }).filter(s => s.nonEmpty).toList.mkString(",")
+    val coverJoinsStr = if (coverJoins.isEmpty) {
+      ""
+    }
+    else {
+      f"WHERE $coverJoins"
+    }
+    val projections = edges.flatMap(e => e.vertices).map(v => vertexName(v, indexToName)).mkString(", ")
+    //val coverJoinStr = f"SELECT ${vertexToAttribute.values.mkString(",")} FROM $edgeNamesStr $coverJoinsStr"
+    val coverJoinStr = f"SELECT $projections FROM $edgeNamesStr $coverJoinsStr"
+
+    val joinString = f"CREATE VIEW $getIdentifier AS $coverJoinStr"
+    val dropString = f"DROP VIEW $getIdentifier"
+    (joinString, dropString)
+  }
+
+  def getIdentifier(): String = {
+    edges.map(e => e.name).toList.sorted.mkString("")
+  }
 
   // get the SQL statements of the bottom up traversal
   def BottomUp(indexToName: scala.collection.immutable.Map[RexInputRef, String], resultString: String,
-               dropString: String): (RelNode, String, String) = {
+               dropString: String, projectJoinAttributes: Set[RexNode]): (String, String) = {
+    val vertices = edges.flatMap(e => e.vertices) //edge.vertices
+
+    var resultString1 = resultString
+    var dropString1 = dropString
+
+    // create semi joins with all children
+    for (c <- children) {
+      //val childEdge = c.edges.head
+      val childVertices = c.edges.flatMap(e => e.vertices)//childEdge.vertices
+      val overlappingVertices = vertices.intersect(childVertices)
+
+
+      val cStringOutput = c.BottomUp(indexToName, resultString1, dropString1, projectJoinAttributes)
+      resultString1 = cStringOutput._1
+      dropString1 = cStringOutput._2
+
+//      val newName = if (edge.nameJoin.contains("stage1_")) {
+//        """(E\d+)(_stage1_)(\d+)""".r.replaceAllIn(edge.nameJoin, m => s"${m.group(1)}${m.group(2)}${m.group(3).toInt + 1}")
+//      } else {edge.nameJoin + "_stage1_0"}
+      val newName = getIdentifier() + "_stage1"
+
+      var result1 = "CREATE UNLOGGED TABLE " + newName + " AS SELECT * FROM " + getIdentifier() +
+        " WHERE EXISTS (SELECT 1 FROM " + c.getIdentifier() + " WHERE "
+      val joinConditions = overlappingVertices.map { vertex =>
+        val att1Name = vertexName(vertex, indexToName)
+        val att2Name = c.vertexName(vertex, indexToName)
+//        result1 = result1 + getIdentifier() + "." + edge.nameJoin.split("_")(0) + "_" + att1_name +
+//          "=" + c.getIdentifier() + "." + childEdge.nameJoin.split("_")(0) + "_" + att2_name + " AND "
+        result1 = result1 + getIdentifier() + "." + att1Name +
+          "=" + c.getIdentifier() + "." + att2Name + " AND "
+      }
+      result1 = result1.dropRight(5) + ")"
+      resultString1 = resultString1 + result1 + "\n"
+      dropString1 = "DROP TABLE " + newName + "\n" + dropString1
+      println("DROP: " + dropString1)
+      //edge.nameJoin = newName
+    }
+    (resultString1, dropString1)
+  }
+
+  // get the SQL statements of the top down traversal
+  def TopDown(indexToName: scala.collection.immutable.Map[RexInputRef, String], resultString: String,
+              dropString: String): (RelNode, String, String) = {
     val edge = edges.head
     val scanPlan = edge.planReference
     val vertices = edge.vertices
     var prevJoin: RelNode = scanPlan
 
-    // create the filtered single tables
-    val dialect = Db2SqlDialect.DEFAULT
-    val relToSqlConverter = new RelToSqlConverter(dialect)
-    val res = relToSqlConverter.visitRoot(scanPlan)
-    val sqlNode1 = res.asQueryOrValues()
-    var result = sqlNode1.toSqlString(dialect, false).getSql()
-    result = "CREATE VIEW " + edge.name + " AS " + result
-    var resultString1 = resultString + result.replace("\n", " ") + "\n"
-    var dropString1 = "DROP VIEW " + edge.name + "\n" + dropString
+    var resultString1 = resultString
+    var dropString1 = dropString
 
-    // create semi joins with all children
+    // create semi joins with all parents
     for (c <- children) {
       val childEdge = c.edges.head
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices.intersect(childVertices)
 
-      val cStringOutput = c.BottomUp(indexToName, resultString1, dropString1)
-      resultString1 = cStringOutput._2
-      dropString1 = cStringOutput._3
-      val newName = edge.nameJoin + childEdge.nameJoin
-      var result1 = "CREATE UNLOGGED TABLE " + newName + " AS SELECT * FROM " + edge.nameJoin +
-        " WHERE EXISTS (SELECT 1 FROM " + childEdge.nameJoin + " WHERE "
+      val newName = if (childEdge.nameJoin.contains("stage2_")) {
+        """(E\d+)(_stage1_)(\d+)""".r.replaceAllIn(childEdge.nameJoin, m => s"${m.group(1)}${m.group(2)}${m.group(3).toInt + 1}")
+      } else {childEdge.nameJoin.replaceAll("""(E\d+)(_stage1_\d+)?""", "$1_stage2_0")}
+
+      var result1 = "CREATE UNLOGGED TABLE " + newName + " AS SELECT * FROM " + childEdge.nameJoin +
+        " WHERE EXISTS (SELECT 1 FROM " + edge.nameJoin + " WHERE "
       val joinConditions = overlappingVertices.map { vertex =>
         val att1 = edge.vertexToAttribute(vertex)
         val att2 = childEdge.vertexToAttribute(vertex)
         val att1_name = indexToName.getOrElse(att1.asInstanceOf[RexInputRef], "")
         val att2_name = indexToName.getOrElse(att2.asInstanceOf[RexInputRef], "")
-        result1 = result1 + edge.nameJoin + "." + att1_name + "=" + childEdge.nameJoin + "." + att2_name + " AND "
+        result1 = result1 + edge.nameJoin + "." + edge.nameJoin.split("_")(0) + "_" + att1_name +
+          "=" + childEdge.nameJoin + "." + childEdge.nameJoin.split("_")(0) + "_" + att2_name + " AND "
       }
+      childEdge.nameJoin = newName
       result1 = result1.dropRight(5) + ")"
       resultString1 = resultString1 + result1 + "\n"
       dropString1 = "DROP TABLE " + newName + "\n" + dropString1
-      edge.nameJoin = newName
-      childEdge.nameJoin = newName
+      val cStringOutput = c.TopDown(indexToName, resultString1, dropString1)
+      resultString1 = cStringOutput._2
+      dropString1 = cStringOutput._3
+      println("DROP: " + dropString1)
     }
     (prevJoin, resultString1, dropString1)
+  }
+
+  // get the SQL statements of the bottom up joins
+  def BottomUpJoin(indexToName: scala.collection.immutable.Map[RexInputRef, String], tablesString: String,
+                   conditionsString: String): (RelNode, String, String) = {
+    val edge = edges.head
+    val scanPlan = edge.planReference
+    val vertices = edge.vertices
+    var prevJoin: RelNode = scanPlan
+
+    var tables = tablesString
+    var conditions = conditionsString
+
+    // create joins with all children
+    for (c <- children) {
+      val childEdge = c.edges.head
+      tables = tables + childEdge.nameJoin + ", "
+
+      val childVertices = childEdge.vertices
+      val overlappingVertices = vertices.intersect(childVertices)
+
+      val cStringOutput = c.BottomUpJoin(indexToName, tables, conditions)
+      conditions = cStringOutput._3
+      tables = cStringOutput._2
+
+      val joinConditions = overlappingVertices.map { vertex =>
+        val att1 = edge.vertexToAttribute(vertex)
+        val att2 = childEdge.vertexToAttribute(vertex)
+        val att1_name = indexToName.getOrElse(att1.asInstanceOf[RexInputRef], "")
+        val att2_name = indexToName.getOrElse(att2.asInstanceOf[RexInputRef], "")
+        conditions = conditions + edge.nameJoin + "." + edge.nameJoin.split("_")(0) + "_" + att1_name +
+          "=" + childEdge.nameJoin + "." + childEdge.nameJoin.split("_")(0) + "_" + att2_name + " AND "
+      }
+    }
+    (prevJoin, tables, conditions)
   }
 
   // define a given root as the new root of the tree
@@ -78,14 +202,26 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     var nodeAtt = List[RexNode]()
 
     // get the node attributes and the agg attributes, with the same mappings
-    val e = edges.head
-    val nodeAttributes = e.planReference.getRowType.getFieldList
-    nodeAttributes.forEach { case x =>
-      var index = x.getIndex + e.attIndex
-      var key = e.attributes(index)
-      nodeAtt = nodeAtt :+ e.attributeToVertex.getOrElse(key, key)
-    }
-    aggAtt = aggAttributes.map(key => e.attributeToVertex.getOrElse(key, key))
+    //val e = edges.head
+    // val nodeAttributes = e.planReference.getRowType.getFieldList
+
+
+//    nodeAttributes.forEach { case x =>
+//      var index = x.getIndex + e.attIndex
+//      var key = e.attributes(index)
+//      nodeAtt = nodeAtt :+ e.attributeToVertex.getOrElse(key, key)
+//    }
+    edges.foreach(e => {
+      val nodeAttributes = e.planReference.getRowType.getFieldList
+      nodeAttributes.forEach { x =>
+        var index = x.getIndex + e.attIndex
+        var key = e.attributes(index)
+        nodeAtt = nodeAtt :+ e.attributeToVertex.getOrElse(key, key)
+      }
+      // TODO is this necessary
+      aggAtt = aggAttributes.map(key => e.attributeToVertex.getOrElse(key, key))
+    })
+
 
     // Check if all aggregates are present in this node
     val allInSet = aggAtt.forall(nodeAtt.contains)
@@ -103,6 +239,10 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       }
       null
     }
+  }
+
+  def getAllNodes: List[HTNode] = {
+    return List(this) ++ children.flatMap(c => c.getAllNodes)
   }
 
   // set references between child-parent relationships in the tree

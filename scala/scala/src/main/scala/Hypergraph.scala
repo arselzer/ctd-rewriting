@@ -1,5 +1,7 @@
 import org.apache.calcite.rel.RelNode
-import org.apache.calcite.rex.{RexCall, RexNode}
+import org.apache.calcite.rel.rel2sql.RelToSqlConverter
+import org.apache.calcite.rex.{RexCall, RexInputRef, RexNode}
+import org.apache.calcite.sql.dialect.Db2SqlDialect
 import org.apache.calcite.sql.fun.SqlStdOperatorTable
 
 import scala.collection.mutable
@@ -8,8 +10,8 @@ import scala.jdk.CollectionConverters._
 class Hypergraph(private val items: Seq[RelNode], private val conditions: Seq[RexNode],
                    private val attributes: Seq[RexNode]){
                    //private val att_map: HashMap[String, String]) {
-    private val vertices: mutable.Set[RexNode] = mutable.Set.empty
-    private val edges: mutable.Set[HGEdge] = mutable.Set.empty
+    val vertices: mutable.Set[RexNode] = mutable.Set.empty
+    val edges: mutable.Set[HGEdge] = mutable.Set.empty
     private val attributeToVertex: mutable.Map[RexNode, RexNode] = mutable.Map.empty
     private var equivalenceClasses: Set[Set[RexNode]] = Set.empty
 

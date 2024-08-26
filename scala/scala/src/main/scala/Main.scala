@@ -48,6 +48,8 @@ object QueryRewriter {
   private var relNodeFiltered: RelNode = null
   private var attributes: Seq[RexInputRef] = null
   private var items: Seq[RelNode] = null
+  private var query: String = null
+  private var projectJoinAttributes: Set[RexNode] = null
 
   private val gatewayServer: GatewayServer = new GatewayServer(this)
 
@@ -190,13 +192,194 @@ object QueryRewriter {
 
   def rewriteCyclicJSON(hdJSON: String): String = {
     val ht = hdStringToHTNode(hdJSON)
+    ht.setParentReferences
 
     rewriteCyclic(ht)
-    return ht.treeToString()
+    ht.treeToString()
   }
 
   def rewriteCyclic(ht: HTNode): Unit = {
+    val resultsDir = "output"
+    Files.createDirectories(Paths.get(resultsDir))
 
+    def writeResults(fileName: String, content: String) = {
+      val filePath = resultsDir + "/" + fileName
+      val filewriter = new PrintWriter(filePath)
+      filewriter.print(content)
+      filewriter.close()
+    }
+
+    var root = ht
+    var finalList: List[String] = List()
+    var listDrop: List[String] = List()
+
+    val startTime = System.nanoTime()
+    if (aggAttributes.isEmpty){
+      println("query has no agg attributes")
+
+      // here we need full enumeration
+      //val root = jointree
+      // Get the output strings for the Bottom Up traversal
+      var resultString = ""
+      var dropString = ""
+      val stringOutput1 = root.BottomUp(indexToName, resultString, dropString, projectJoinAttributes)
+      val stringForJson1 = stringOutput1._1.replace(schemaName + ".", "")
+      val listForJson1 = stringForJson1.split("\n").toList
+      println("bottom up: " + listForJson1)
+      // Get the output strings for the Top Down traversal
+      val stringOutput2 = root.TopDown(indexToName, resultString, dropString)
+      val stringForJson2 = stringOutput2._2.replace(schemaName + ".", "")
+      val listForJson2 = stringForJson2.split("\n").toList
+      println("top down: " + listForJson2)
+      // Get the output strings for the Bottom Up Joins
+      var tablesString = ""
+      var conditionsString = ""
+      val stringOutput3 = root.BottomUpJoin(indexToName, tablesString, conditionsString)
+      val stringForJson3 = "CREATE UNLOGGED TABLE E_stage3 AS SELECT * FROM " + root.edges.head.nameJoin +
+        ", " + stringOutput3._2.dropRight(2) + " WHERE " + stringOutput3._3.dropRight(5)
+      val listForJson3 = stringForJson3.split("\n").toList
+      println("bottom up joins: " + listForJson3)
+
+      // write a SELECT of the final table
+      val listForJsonLast = listForJson3.last
+      val keyword = "TABLE "
+      val substringAfterKeyword = listForJsonLast.substring(listForJsonLast.indexOf(keyword) + keyword.length)
+      val table = substringAfterKeyword.split("\\s+").headOption.getOrElse("")
+      table.trim
+      val selectString = "SELECT * FROM " + table
+
+      finalList = listForJson1 ++ listForJson2 ++ listForJson3 ++ List(selectString)
+      listDrop = List("DROP TABLE E_stage3") ++ stringOutput2._3.split("\n").toList ++ stringOutput1._2.split("\n").toList
+      println("final " + finalList)
+      println("dropping " + listDrop)
+    }
+    else {
+      val findNodeContainingAttributes = ht.findNodeContainingAttributes(aggAttributes)
+      val nodeContainingAttributes = findNodeContainingAttributes._1
+      println("nodeContaining: " + nodeContainingAttributes)
+      //aggAttributes = findNodeContainingAttributes._2
+      //println("aggAttofRoot: " + aggAttributes)
+
+      if (nodeContainingAttributes == null) {
+        println("attributes are not contained in only one node")
+      }
+      else {
+        println("one node contains all attributes")
+
+        // reroot the tree, such that the root contains all attributes
+        root = nodeContainingAttributes.reroot
+        println("new root: " + root + " b: " + root.edges.head.planReference.getRowType)
+
+        // get the aggregate, which are applied at the end on the rerooted root
+        val stringAtt = aggAttributes.map{a => indexToName(a.asInstanceOf[RexInputRef])}
+        val allAgg: String = relNodeFiltered match {
+          case aggregate: LogicalAggregate =>
+            val namedAggCalls = aggregate.getNamedAggCalls.asScala
+            val zippedResults = namedAggCalls.zip(stringAtt)
+            val formattedAgg = zippedResults.map { case (aggCall, att) =>
+              val aggStr = aggCall.left.getAggregation
+              val name = aggCall.left.name
+              s"$aggStr($att) AS $name"
+            }
+            formattedAgg.mkString(", ")
+        }
+
+        // Get the output strings for the Bottom Up traversal
+        var resultString = ""
+        var dropString = ""
+
+        val (stringOutputEdges, dropListEdges) = createEdgeViews(projectJoinAttributes)
+
+        val (stringOutputCover, dropListCover) = createCoverJoinViews(ht, projectJoinAttributes)
+
+        val stringOutput = root.BottomUp(indexToName, resultString, dropString, projectJoinAttributes)
+        val stringForJson = stringOutput._1.replace(schemaName + ".", "")
+        val listForJson = stringForJson.split("\n").toList
+
+        // add the aggregate to the last CREATE
+        val listForJsonLast = listForJson.last
+        val modifiedLastString = listForJsonLast.replace("*", allAgg)
+        val listForJsonAgg = listForJson.init :+ modifiedLastString
+
+        // write a SELECT of the final table
+        val keyword = "TABLE "
+        val substringAfterKeyword = listForJsonLast.substring(listForJsonLast.indexOf(keyword) + keyword.length)
+        val table = substringAfterKeyword.split("\\s+").headOption.getOrElse("")
+        table.trim
+        val selectString = "SELECT * FROM " + table
+
+        // write a txt file with a visulization of the join tree
+        println(root.treeToString(0))
+        writeResults("jointree.txt", root.treeToString(0))
+
+        finalList = stringOutputEdges ++ stringOutputCover ++ listForJsonAgg ++ List(selectString)
+        // val finalList = listForJsonAgg ++ List(selectString) ++ listDrop
+        listDrop = dropListEdges ++ dropListCover ++ stringOutput._2.split("\n").toList
+      }
+
+      // stop the time for the whole program in seconds and give it to the json
+      val endTime = System.nanoTime()
+      val executionTime = (endTime - startTime) / 1e9
+
+      /// for the column Date, we needed \\\"Date\\\" for this scala, but now we want Date again
+      val original = query.replace("\"Date\"", "Date")
+
+      // GET FEATURES OF THE JOIN TREE
+      // get the tree depth
+      var treeDepth = root.getTreeDepth(root,0)
+      println("depth: " + treeDepth)
+      // get the item lifetimes
+      var containerCounts = root.getContainerCount(hg.getEquivalenceClasses, attributes)
+      println("container counts: " + containerCounts)
+      // get the branching factor
+      var branchingFactors = root.getBranchingFactors(root)
+      println("branching factors: " + branchingFactors)
+      // get the balancedness factor
+      var balancednessFactors = root.getBalancednessFactors(root)
+      var balancednessFactor = balancednessFactors._2.sum / balancednessFactors._2.length
+      println("balancedness factor: " + balancednessFactors + "  " + balancednessFactor)
+      // save all features in one list
+      var features = List(treeDepth, containerCounts, branchingFactors, balancednessFactor).toString
+
+      val jsonOutput = JsonOutput(original, finalList, features, executionTime, true)
+      val json: String = write(jsonOutput)
+      writeResults("output.json", json.toString)
+
+      writeResults("jointree.txt", root.treeToString(0))
+
+      val jsonOutputDrop = JsonOutput("", listDrop, "", 0, true)
+      val jsonDrop: String = write(jsonOutputDrop)
+      writeResults("drop.json", jsonDrop.toString)
+    }
+  }
+
+  def createEdgeViews(projectJoinAttributes: Set[RexNode]): (List[String], List[String]) = {
+    val viewQueries = hg.edges.map(edge => {
+      val dialect = Db2SqlDialect.DEFAULT
+      val relToSqlConverter = new RelToSqlConverter(dialect)
+      val res = relToSqlConverter.visitRoot(edge.planReference)
+      val sqlNode1 = res.asQueryOrValues()
+      var result = sqlNode1.toSqlString(dialect, false).getSql()
+      val tableName = """AS\s+(\S+)(?:\s+WHERE|$)""".r.findFirstMatchIn(result).get.group(1)
+      val projections = edge.vertices.intersect(projectJoinAttributes).map { vertex =>
+        val att1 = edge.vertexToAttribute(vertex)
+        val att1_name = indexToName.getOrElse(att1.asInstanceOf[RexInputRef], "")
+        tableName + "." + att1_name + " AS " + edge.name + "_" + att1_name
+      }.mkString(",")
+      result = result.replace("*", projections)
+      result = "CREATE VIEW " + edge.name + " AS " + result
+      result
+    }).toList
+    val dropQueries = hg.edges.map(edge => {
+      "DROP VIEW " + edge.name
+    }).toList
+    (viewQueries, dropQueries)
+  }
+
+  def createCoverJoinViews(ht: HTNode, projectJoinAttributes: Set[RexNode]): (List[String], List[String]) = {
+    var dropStrings: List[String] = List()
+    ht.getAllNodes.map(node => node.getCoverJoin(indexToName))
+      .unzip
   }
 
   /**
@@ -207,10 +390,24 @@ object QueryRewriter {
   def rewrite(query: String): Unit = {
     val startTime = System.nanoTime()
 
+    this.query = query
+
     getHypergraph(query)
 
     // calculate the join tree
     val jointree = hg.flatGYO
+
+    // get the attributes of the last projection and all join attributes
+    // (for being able to drop columns we do not need)
+    var projectAttributes: Set[RexNode] = relNodeFiltered match {
+      case project: LogicalProject => project.getProjects.asScala.toSet
+      case _ => aggAttributes.toSet
+    }
+    println("projectAttributes: " + projectAttributes)
+    var joinAttributes = hg.getEquivalenceClasses.flatten
+    println("joinAttributes: " + joinAttributes)
+    projectJoinAttributes = projectAttributes.union(joinAttributes)
+    println("projectJoinAttributes: " + projectJoinAttributes)
 
     val resultsDir = "output"
     Files.createDirectories(Paths.get(resultsDir))
@@ -234,8 +431,48 @@ object QueryRewriter {
     else {
       // First check if there is a single tree node, i.e., relation that contains all attributes
       // contained in the aggregate functions -> Query 0MA
+      var root = jointree
+      var finalList: List[String] = List()
+      var listDrop: List[String] = List()
+
       if (aggAttributes.isEmpty){
         println("query has no attributes")
+
+        // here we need full enumeration
+        //val root = jointree
+        // Get the output strings for the Bottom Up traversal
+        var resultString = ""
+        var dropString = ""
+        val stringOutput1 = root.BottomUp(indexToName, resultString, dropString, projectJoinAttributes)
+        val stringForJson1 = stringOutput1._1.replace(schemaName + ".", "")
+        val listForJson1 = stringForJson1.split("\n").toList
+        println("bottom up: " + listForJson1)
+        // Get the output strings for the Top Down traversal
+        val stringOutput2 = root.TopDown(indexToName, resultString, dropString)
+        val stringForJson2 = stringOutput2._2.replace(schemaName + ".", "")
+        val listForJson2 = stringForJson2.split("\n").toList
+        println("top down: " + listForJson2)
+        // Get the output strings for the Bottom Up Joins
+        var tablesString = ""
+        var conditionsString = ""
+        val stringOutput3 = root.BottomUpJoin(indexToName, tablesString, conditionsString)
+        val stringForJson3 = "CREATE UNLOGGED TABLE E_stage3 AS SELECT * FROM " + root.edges.head.nameJoin +
+          ", " + stringOutput3._2.dropRight(2) + " WHERE " + stringOutput3._3.dropRight(5)
+        val listForJson3 = stringForJson3.split("\n").toList
+        println("bottom up joins: " + listForJson3)
+
+        // write a SELECT of the final table
+        val listForJsonLast = listForJson3.last
+        val keyword = "TABLE "
+        val substringAfterKeyword = listForJsonLast.substring(listForJsonLast.indexOf(keyword) + keyword.length)
+        val table = substringAfterKeyword.split("\\s+").headOption.getOrElse("")
+        table.trim
+        val selectString = "SELECT * FROM " + table
+
+        finalList = listForJson1 ++ listForJson2 ++ listForJson3 ++ List(selectString)
+        listDrop = List("DROP TABLE E_stage3") ++ stringOutput2._3.split("\n").toList ++ stringOutput1._2.split("\n").toList
+        println("final " + finalList)
+        println("dropping " + listDrop)
       }
       else {
         val findNodeContainingAttributes = jointree.findNodeContainingAttributes(aggAttributes)
@@ -271,8 +508,8 @@ object QueryRewriter {
           // Get the output strings for the Bottom Up traversal
           var resultString = ""
           var dropString = ""
-          val stringOutput = root.BottomUp(indexToName, resultString, dropString)
-          val stringForJson = stringOutput._2.replace(schemaName + ".", "")
+          val stringOutput = root.BottomUp(indexToName, resultString, dropString, projectJoinAttributes)
+          val stringForJson = stringOutput._1.replace(schemaName + ".", "")
           val listForJson = stringForJson.split("\n").toList
 
           // add the aggregate to the last CREATE
@@ -343,7 +580,7 @@ object QueryRewriter {
           writeResults("output.json", json.toString)
 
           // write a file, which makes dropping the tables after creating them easy
-          val listDrop = stringOutput._3.split("\n").toList
+          val listDrop = stringOutput._2.split("\n").toList
           val jsonOutputDrop = JsonOutput("", listDrop, "", 0, true)
           val jsonDrop: String = write(jsonOutputDrop)
           writeResults("drop.json", jsonDrop.toString)
