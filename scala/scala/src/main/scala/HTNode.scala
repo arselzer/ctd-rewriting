@@ -71,11 +71,11 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     var dropString1 = dropString
 
     // create semi joins with all children
+    var joinIndex = 1
     for (c <- children) {
       //val childEdge = c.edges.head
       val childVertices = c.edges.flatMap(e => e.vertices)//childEdge.vertices
       val overlappingVertices = vertices.intersect(childVertices)
-
 
       val cStringOutput = c.BottomUp(indexToName, resultString1, dropString1, projectJoinAttributes)
       resultString1 = cStringOutput._1
@@ -84,22 +84,26 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 //      val newName = if (edge.nameJoin.contains("stage1_")) {
 //        """(E\d+)(_stage1_)(\d+)""".r.replaceAllIn(edge.nameJoin, m => s"${m.group(1)}${m.group(2)}${m.group(3).toInt + 1}")
 //      } else {edge.nameJoin + "_stage1_0"}
-      val newName = getIdentifier() + "_stage1"
+      val joinSuffix: String = if (joinIndex == children.size) "final" else joinIndex.toString
+      val lastName = if (joinIndex == 1) f"${getIdentifier}" else f"${getIdentifier}_stage1_${joinIndex - 1}"
+      val newName = f"${getIdentifier}_stage1_$joinSuffix"
 
-      var result1 = "CREATE UNLOGGED TABLE " + newName + " AS SELECT * FROM " + getIdentifier() +
-        " WHERE EXISTS (SELECT 1 FROM " + c.getIdentifier() + " WHERE "
+      val childIdentifier = if (c.edges.size > 1) f"${c.getIdentifier}_final" else c.getIdentifier()
+      var result1 = "CREATE UNLOGGED TABLE " + newName + " AS SELECT * FROM " + lastName +
+        " WHERE EXISTS (SELECT 1 FROM " + childIdentifier + " WHERE "
       val joinConditions = overlappingVertices.map { vertex =>
         val att1Name = vertexName(vertex, indexToName)
         val att2Name = c.vertexName(vertex, indexToName)
 //        result1 = result1 + getIdentifier() + "." + edge.nameJoin.split("_")(0) + "_" + att1_name +
 //          "=" + c.getIdentifier() + "." + childEdge.nameJoin.split("_")(0) + "_" + att2_name + " AND "
-        result1 = result1 + getIdentifier() + "." + att1Name +
-          "=" + c.getIdentifier() + "." + att2Name + " AND "
+        result1 = result1 + lastName + "." + att1Name +
+          "=" + childIdentifier + "." + att2Name + " AND "
       }
       result1 = result1.dropRight(5) + ")"
       resultString1 = resultString1 + result1 + "\n"
       dropString1 = "DROP TABLE " + newName + "\n" + dropString1
       println("DROP: " + dropString1)
+      joinIndex += 1
       //edge.nameJoin = newName
     }
     (resultString1, dropString1)
