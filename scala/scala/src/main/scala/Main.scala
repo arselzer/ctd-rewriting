@@ -1,4 +1,4 @@
-import java.sql.{Connection, DriverManager}
+import java.sql.{Connection, DriverManager, ResultSet}
 import java.util.Properties
 import org.apache.calcite.adapter.jdbc.JdbcSchema
 import org.apache.calcite.jdbc.CalciteConnection
@@ -39,6 +39,7 @@ object JsonOutput {
 
 object QueryRewriter {
   // The state after hypergraph extraction is needed for creating the final output
+  private var pgConnection: Connection = null
   private var frameworkConfig: FrameworkConfig = null
   private var planner: Planner = null
   private var schemaName: String = null
@@ -75,6 +76,11 @@ object QueryRewriter {
       .build
 
     this.schemaName = schemaName
+
+    pgConnection = ds.getConnection
+//    val postgresUrl = "jdbc:postgresql://localhost/test"
+//    val postgresProperties = new Properties()
+//    postgresProperties.setProperty("user, ")
   }
 
   def main(args: Array[String]): Unit = {
@@ -115,6 +121,7 @@ object QueryRewriter {
     // get the logical query plan
     val relRoot = planner.rel(validatedSqlNode)
     val relNode = relRoot.project
+    relNode.getCluster.getMetadataQuery
 
     // push the filters in the logical query plan down
     relNodeFiltered = pushDownFilters(relNode)
@@ -188,6 +195,41 @@ object QueryRewriter {
 
     val jsonNode = read[JSONNode](hdJSON)
     jsonNodeToHTNode(jsonNode)
+  }
+
+  def determineNodeWeights(candidateNodes: List[List[String]]): List[(List[String], String)] = {
+    val (stringOutputEdges, dropListEdges) = createEdgeViews(projectJoinAttributes)
+
+    stringOutputEdges.foreach(createStr => {
+      val stmt = pgConnection.createStatement()
+      stmt.executeUpdate(createStr)
+    })
+
+    val nodeWeights = candidateNodes.map(cover => {
+      val edges = hg.edges.filter(e => cover contains e.name).toSet
+      val node = new HTNode(edges, Set(), null)
+      val explainStr = node.getCoverJoinSelect(indexToName)
+
+      val stmt = pgConnection.createStatement()
+      //new PrintWriter("query.sql") { write(f"EXPLAIN (FORMAT JSON) $explainStr"); close }
+      val rs = stmt.executeQuery(f"EXPLAIN (FORMAT JSON) $explainStr")
+
+      var jsonOutput = ""
+
+      while (rs.next()) {
+        jsonOutput = jsonOutput + rs.getString(1)
+      }
+
+      (cover, jsonOutput)
+    })
+
+    nodeWeights
+  }
+
+  def determineNodeWeightsJSON(candidateNodesStr: String): String = {
+   val candidateNodes: List[List[String]] = upickle.default.read[List[List[String]]](candidateNodesStr)
+
+    upickle.default.write(determineNodeWeights(candidateNodes))
   }
 
   def rewriteCyclicJSON(hdJSON: String): String = {
@@ -368,7 +410,7 @@ object QueryRewriter {
         tableName + "." + att1_name + " AS " + edge.name + "_" + att1_name
       }.mkString(",")
       result = result.replace("*", projections)
-      result = "CREATE VIEW " + edge.name + " AS " + result
+      result = "CREATE OR REPLACE VIEW " + edge.name + " AS " + result
       result
     }).toList
     val dropQueries = hg.edges.map(edge => {

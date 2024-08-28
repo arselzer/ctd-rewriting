@@ -16,26 +16,27 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     vertexToEdge(vertex).name + "_" + indexToName.getOrElse(vertexToAttribute(vertex).asInstanceOf[RexInputRef], "")
   }
 
-  def getCoverJoin(indexToName: scala.collection.immutable.Map[RexInputRef, String]): (String, String) = {
+  // Returns just the SELECT query, while getCoverJoin returns the CREATE TABLE statements as well
+  def getCoverJoinSelect(indexToName: scala.collection.immutable.Map[RexInputRef, String]): String = {
     val edgeNames = edges.map(e => e.name)
     val edgeNamesStr = edgeNames.toList.mkString(", ")
     val coverJoins = edges.flatMap(e => e.vertices).map(v => {
-        val edgesContainingVariable = edges.filter(e => e.vertices.contains(v)).toList
-        if (edgesContainingVariable.isEmpty) {
-          ""
-        }
-        else {
-          edgesContainingVariable.indices.dropRight(1).map(i => {
-            val edge1 = edgesContainingVariable(i)
-            val edge2 = edgesContainingVariable(i+1)
-            val att1 = edge1.vertexToAttribute(v)
-            val att2 = edge2.vertexToAttribute(v)
-            val att1Name = indexToName.getOrElse(att1.asInstanceOf[RexInputRef], "")
-            val att2Name = indexToName.getOrElse(att2.asInstanceOf[RexInputRef], "")
-            f"${edge1.name}_$att1Name = ${edge2.name}_$att2Name"
-          }).mkString(" AND ")
-        }
-      }).filter(s => s.nonEmpty).toList.mkString(",")
+      val edgesContainingVariable = edges.filter(e => e.vertices.contains(v)).toList
+      if (edgesContainingVariable.isEmpty) {
+        ""
+      }
+      else {
+        edgesContainingVariable.indices.dropRight(1).map(i => {
+          val edge1 = edgesContainingVariable(i)
+          val edge2 = edgesContainingVariable(i+1)
+          val att1 = edge1.vertexToAttribute(v)
+          val att2 = edge2.vertexToAttribute(v)
+          val att1Name = indexToName.getOrElse(att1.asInstanceOf[RexInputRef], "")
+          val att2Name = indexToName.getOrElse(att2.asInstanceOf[RexInputRef], "")
+          f"${edge1.name}_$att1Name = ${edge2.name}_$att2Name"
+        }).mkString(" AND ")
+      }
+    }).filter(s => s.nonEmpty).toList.mkString(" AND ")
     val coverJoinsStr = if (coverJoins.isEmpty) {
       ""
     }
@@ -46,8 +47,14 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     //val coverJoinStr = f"SELECT ${vertexToAttribute.values.mkString(",")} FROM $edgeNamesStr $coverJoinsStr"
     val coverJoinStr = f"SELECT $projections FROM $edgeNamesStr $coverJoinsStr"
 
-    val joinString = f"CREATE VIEW $getIdentifier AS $coverJoinStr"
-    val dropString = f"DROP VIEW $getIdentifier"
+    coverJoinStr
+  }
+
+  def getCoverJoin(indexToName: scala.collection.immutable.Map[RexInputRef, String]): (String, String) = {
+    val coverJoinStr = getCoverJoinSelect(indexToName)
+
+    val joinString = f"CREATE UNLOGGED TABLE $getIdentifier AS $coverJoinStr"
+    val dropString = f"DROP TABLE $getIdentifier"
     (joinString, dropString)
   }
 
