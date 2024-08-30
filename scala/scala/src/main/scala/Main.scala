@@ -314,7 +314,7 @@ object QueryRewriter {
         println("new root: " + root + " b: " + root.edges.head.planReference.getRowType)
 
         // get the aggregate, which are applied at the end on the rerooted root
-        val stringAtt = aggAttributes.map{a => indexToName(a.asInstanceOf[RexInputRef])}
+        val stringAtt = aggAttributes.map{a => root.vertexName(a.asInstanceOf[RexInputRef], indexToName)}
         val allAgg: String = relNodeFiltered match {
           case aggregate: LogicalAggregate =>
             val namedAggCalls = aggregate.getNamedAggCalls.asScala

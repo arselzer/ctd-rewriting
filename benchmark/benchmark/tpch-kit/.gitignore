@@ -1,0 +1,3 @@
+*.o
+*.tbl
+dbgen/qgen

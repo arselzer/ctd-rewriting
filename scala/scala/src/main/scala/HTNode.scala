@@ -88,10 +88,10 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val lastName = if (joinIndex == 1) f"${getIdentifier}" else f"${getIdentifier}_stage1_${joinIndex - 1}"
       val newName = f"${getIdentifier}_stage1_$joinSuffix"
 
-      val childIdentifier = if (c.edges.size > 1) f"${c.getIdentifier}_final" else c.getIdentifier()
+      val childIdentifier = if (c.children.nonEmpty) f"${c.getIdentifier}_stage1_final" else c.getIdentifier()
       var result1 = "CREATE UNLOGGED TABLE " + newName + " AS SELECT * FROM " + lastName +
         " WHERE EXISTS (SELECT 1 FROM " + childIdentifier + " WHERE "
-      val joinConditions = overlappingVertices.map { vertex =>
+      overlappingVertices.foreach { vertex =>
         val att1Name = vertexName(vertex, indexToName)
         val att2Name = c.vertexName(vertex, indexToName)
 //        result1 = result1 + getIdentifier() + "." + edge.nameJoin.split("_")(0) + "_" + att1_name +
