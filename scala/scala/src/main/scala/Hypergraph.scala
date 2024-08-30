@@ -1,6 +1,7 @@
 import org.apache.calcite.rel.RelNode
 import org.apache.calcite.rel.rel2sql.RelToSqlConverter
 import org.apache.calcite.rex.{RexCall, RexInputRef, RexNode}
+import org.apache.calcite.sql.SqlKind
 import org.apache.calcite.sql.dialect.Db2SqlDialect
 import org.apache.calcite.sql.fun.SqlStdOperatorTable
 
@@ -15,14 +16,29 @@ class Hypergraph(private val items: Seq[RelNode], private val conditions: Seq[Re
     private val attributeToVertex: mutable.Map[RexNode, RexNode] = mutable.Map.empty
     private var equivalenceClasses: Set[Set[RexNode]] = Set.empty
 
+    // Get the actual join attribute, which might be contained
+    // in a CAST statement (RexCall)
+    def getAttribute(node: RexNode): RexNode = {
+      node match {
+        case n: RexCall => {
+          n.getOperands.asScala.map(o => getAttribute(o))
+            .filter(o => o != null).head
+        }
+        case n: RexInputRef => {
+          n
+        }
+        case _ => null
+      }
+    }
+
     // add all equality conditions to the equivalence classes
     for (cond <- conditions) {
       cond match {
         case call: RexCall if call.getOperator == SqlStdOperatorTable.EQUALS =>
           val operands = call.getOperands.asScala.toList
           if (operands.size == 2) {
-            val lAtt = operands.head
-            val rAtt = operands(1)
+            val lAtt = getAttribute(operands.head)
+            val rAtt = getAttribute(operands(1))
             equivalenceClasses += Set(lAtt, rAtt)
           }
         case _ => println("other")
