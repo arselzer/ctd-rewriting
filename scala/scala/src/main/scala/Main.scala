@@ -30,6 +30,9 @@ import java.io.PrintWriter
 import py4j.GatewayServer
 import upickle.core.Types
 
+import javax.sql.DataSource
+import scala.collection.parallel.CollectionConverters.ImmutableIterableIsParallelizable
+
 case class JsonOutput(original_query: String, rewritten_query: List[String],
                       features: String, time: Double, acyclic: Boolean)
 
@@ -39,6 +42,7 @@ object JsonOutput {
 
 object QueryRewriter {
   // The state after hypergraph extraction is needed for creating the final output
+  private var ds: DataSource = null
   private var pgConnection: Connection = null
   private var frameworkConfig: FrameworkConfig = null
   private var planner: Planner = null
@@ -61,7 +65,7 @@ object QueryRewriter {
     val calciteConnection = connection.unwrap(classOf[CalciteConnection])
     val rootSchema = calciteConnection.getRootSchema
     // val ds = JdbcSchema.dataSource("jdbc:postgresql://localhost:5432/stats", "org.postgresql.Driver", "stats", "stats")
-    val ds = JdbcSchema.dataSource(jdbcUrl, "org.postgresql.Driver", jdbcUser, jdbcPassword)
+    ds = JdbcSchema.dataSource(jdbcUrl, "org.postgresql.Driver", jdbcUser, jdbcPassword)
     rootSchema.add(schemaName, JdbcSchema.create(rootSchema, schemaName, ds, null, null))
 
     val outputDir = "output"
@@ -205,25 +209,32 @@ object QueryRewriter {
       stmt.executeUpdate(createStr)
     })
 
-    val nodeWeights = candidateNodes.map(cover => {
-      val edges = hg.edges.filter(e => cover contains e.name).toSet
-      val node = new HTNode(edges, Set(), null)
-      val explainStr = node.getCoverJoinSelect(indexToName)
+    val nodeWeights = candidateNodes.grouped(candidateNodes.size / Runtime.getRuntime.availableProcessors()).toList.par
+      .flatMap(candidateNodesSplit => {
+        val conn = ds.getConnection
+        val output = candidateNodesSplit.map(cover => {
+          val edges = hg.edges.filter(e => cover contains e.name).toSet
+          val node = new HTNode(edges, Set(), null)
+          val explainStr = node.getCoverJoinSelect(indexToName)
 
-      val stmt = pgConnection.createStatement()
-      //new PrintWriter("query.sql") { write(f"EXPLAIN (FORMAT JSON) $explainStr"); close }
-      val rs = stmt.executeQuery(f"EXPLAIN (FORMAT JSON) $explainStr")
+          val stmt = conn.createStatement()
+          //new PrintWriter("query.sql") { write(f"EXPLAIN (FORMAT JSON) $explainStr"); close }
+          val rs = stmt.executeQuery(f"EXPLAIN (FORMAT JSON) $explainStr")
 
-      var jsonOutput = ""
+          var jsonOutput = ""
 
-      while (rs.next()) {
-        jsonOutput = jsonOutput + rs.getString(1)
-      }
+          while (rs.next()) {
+            jsonOutput = jsonOutput + rs.getString(1)
+          }
 
-      (cover, jsonOutput)
-    })
+          (cover, jsonOutput)
+        })
+        conn.close()
+        output
+      })
 
-    nodeWeights
+
+    nodeWeights.toList
   }
 
   def determineNodeWeightsJSON(candidateNodesStr: String): String = {
