@@ -414,7 +414,7 @@ object QueryRewriter {
       result
     }).toList
     val dropQueries = hg.edges.map(edge => {
-      "DROP VIEW " + edge.name
+      "DROP VIEW IF EXISTS " + edge.name
     }).toList
     (viewQueries, dropQueries)
   }

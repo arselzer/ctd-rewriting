@@ -53,8 +53,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
   def getCoverJoin(indexToName: scala.collection.immutable.Map[RexInputRef, String]): (String, String) = {
     val coverJoinStr = getCoverJoinSelect(indexToName)
 
-    val joinString = f"CREATE UNLOGGED TABLE $getIdentifier AS $coverJoinStr"
-    val dropString = f"DROP TABLE $getIdentifier"
+    val joinString = f"CREATE OR REPLACE VIEW $getIdentifier AS $coverJoinStr"
+    val dropString = f"DROP VIEW IF EXISTS $getIdentifier"
     (joinString, dropString)
   }
 
@@ -101,7 +101,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       }
       result1 = result1.dropRight(5) + ")"
       resultString1 = resultString1 + result1 + "\n"
-      dropString1 = "DROP TABLE " + newName + "\n" + dropString1
+      dropString1 = "DROP TABLE  IF EXISTS" + newName + "\n" + dropString1
       println("DROP: " + dropString1)
       joinIndex += 1
       //edge.nameJoin = newName
