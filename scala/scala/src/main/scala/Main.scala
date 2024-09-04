@@ -209,7 +209,7 @@ object QueryRewriter {
       stmt.executeUpdate(createStr)
     })
 
-    val nodeWeights = candidateNodes.grouped(candidateNodes.size / Runtime.getRuntime.availableProcessors()).toList.par
+    val nodeWeights = candidateNodes.grouped(Math.max(1, candidateNodes.size / Runtime.getRuntime.availableProcessors())).toList.par
       .flatMap(candidateNodesSplit => {
         val conn = ds.getConnection
         val output = candidateNodesSplit.map(cover => {
@@ -355,12 +355,24 @@ object QueryRewriter {
         val modifiedLastString = listForJsonLast.replace("*", allAgg)
         val listForJsonAgg = listForJson.init :+ modifiedLastString
 
+        //new PrintWriter("last statement.txt") { write(stringOutput._1); close }
+        //new PrintWriter("ht.txt") { write(root.treeToString()); close }
         // write a SELECT of the final table
-        val keyword = "TABLE "
-        val substringAfterKeyword = listForJsonLast.substring(listForJsonLast.indexOf(keyword) + keyword.length)
-        val table = substringAfterKeyword.split("\\s+").headOption.getOrElse("")
-        table.trim
-        val selectString = "SELECT * FROM " + table
+        val selectString = if (listForJsonLast.nonEmpty) {
+          val keyword = "TABLE "
+          val substringAfterKeyword = listForJsonLast.substring(listForJsonLast.indexOf(keyword) + keyword.length)
+          val table = substringAfterKeyword.split("\\s+").headOption.getOrElse("")
+
+          f"SELECT * FROM $table"
+        }
+        else {
+          // It could happen that all tables are in a single node -> no CREATE TABLE statements
+          val keyword = "VIEW "
+          val createViewString = stringOutputEdges.last
+          val substringAfterKeyword = createViewString.substring(createViewString.indexOf(keyword) + keyword.length)
+          val view = substringAfterKeyword.split("\\s+").headOption.getOrElse("")
+          f"SELECT $allAgg FROM $view"
+        }
 
         // write a txt file with a visulization of the join tree
         println(root.treeToString(0))
