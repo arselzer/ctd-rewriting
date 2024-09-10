@@ -54,6 +54,7 @@ object QueryRewriter {
   private var attributes: Seq[RexInputRef] = null
   private var items: Seq[RelNode] = null
   private var query: String = null
+  private var projectAttributes: Set[RexNode] = null
   private var projectJoinAttributes: Set[RexNode] = null
 
   private val gatewayServer: GatewayServer = new GatewayServer(this)
@@ -204,9 +205,11 @@ object QueryRewriter {
   def determineNodeWeights(candidateNodes: List[List[String]]): List[(List[String], String)] = {
     val (stringOutputEdges, dropListEdges) = createEdgeViews(projectJoinAttributes)
 
+
     stringOutputEdges.foreach(createStr => {
       val stmt = pgConnection.createStatement()
       stmt.executeUpdate(createStr)
+      stmt.close()
     })
 
     val nodeWeights = candidateNodes.grouped(Math.max(1, candidateNodes.size / Runtime.getRuntime.availableProcessors())).toList.par
@@ -218,7 +221,6 @@ object QueryRewriter {
           val explainStr = node.getCoverJoinSelect(indexToName)
 
           val stmt = conn.createStatement()
-          //new PrintWriter("query.sql") { write(f"EXPLAIN (FORMAT JSON) $explainStr"); close }
           val rs = stmt.executeQuery(f"EXPLAIN (FORMAT JSON) $explainStr")
 
           var jsonOutput = ""
@@ -232,7 +234,6 @@ object QueryRewriter {
         conn.close()
         output
       })
-
 
     nodeWeights.toList
   }
@@ -288,9 +289,11 @@ object QueryRewriter {
       // Get the output strings for the Bottom Up Joins
       var tablesString = ""
       var conditionsString = ""
-      val stringOutput3 = root.BottomUpJoin(indexToName, tablesString, conditionsString)
-      val stringForJson3 = "CREATE UNLOGGED TABLE E_stage3 AS SELECT * FROM " + root.edges.head.nameJoin +
-        ", " + stringOutput3._2.dropRight(2) + " WHERE " + stringOutput3._3.dropRight(5)
+      var projectionsString = ""
+      val stringOutput3 = root.BottomUpJoin(indexToName, tablesString, conditionsString, projectionsString,
+        projectAttributes,true)
+      val stringForJson3 = "CREATE UNLOGGED TABLE E_stage3 AS SELECT " + stringOutput3._4.dropRight(2) + " FROM " +
+        stringOutput3._2.dropRight(2) + " WHERE " + stringOutput3._3.dropRight(5)
       val listForJson3 = stringForJson3.split("\n").toList
       println("bottom up joins: " + listForJson3)
 
@@ -464,7 +467,7 @@ object QueryRewriter {
 
     // get the attributes of the last projection and all join attributes
     // (for being able to drop columns we do not need)
-    var projectAttributes: Set[RexNode] = relNodeFiltered match {
+    projectAttributes = relNodeFiltered match {
       case project: LogicalProject => project.getProjects.asScala.toSet
       case _ => aggAttributes.toSet
     }
@@ -476,6 +479,9 @@ object QueryRewriter {
 
     val resultsDir = "output"
     Files.createDirectories(Paths.get(resultsDir))
+
+    /// for the column Date, we needed \\\"Date\\\" for this scala, but now we want Date again
+    val original = query.replace("\"Date\"", "Date")
 
     def writeResults(fileName: String, content: String) = {
       val filePath = resultsDir + "/" + fileName
@@ -500,8 +506,10 @@ object QueryRewriter {
       var finalList: List[String] = List()
       var listDrop: List[String] = List()
 
-      if (aggAttributes.isEmpty){
-        println("query has no attributes")
+      val (stringOutputEdges, dropListEdges) = createEdgeViews(projectJoinAttributes)
+
+      if (aggAttributes.isEmpty) {
+        println("query has no agg attributes")
 
         // here we need full enumeration
         //val root = jointree
@@ -520,9 +528,11 @@ object QueryRewriter {
         // Get the output strings for the Bottom Up Joins
         var tablesString = ""
         var conditionsString = ""
-        val stringOutput3 = root.BottomUpJoin(indexToName, tablesString, conditionsString)
-        val stringForJson3 = "CREATE UNLOGGED TABLE E_stage3 AS SELECT * FROM " + root.edges.head.nameJoin +
-          ", " + stringOutput3._2.dropRight(2) + " WHERE " + stringOutput3._3.dropRight(5)
+        var projectionsString = ""
+        val stringOutput3 = root.BottomUpJoin(indexToName, tablesString, conditionsString, projectionsString,
+          projectAttributes, true)
+        val stringForJson3 = "CREATE UNLOGGED TABLE E_stage3 AS SELECT " + stringOutput3._4.dropRight(2) + " FROM " +
+          stringOutput3._2.dropRight(2) + " WHERE " + stringOutput3._3.dropRight(5)
         val listForJson3 = stringForJson3.split("\n").toList
         println("bottom up joins: " + listForJson3)
 
@@ -534,7 +544,7 @@ object QueryRewriter {
         table.trim
         val selectString = "SELECT * FROM " + table
 
-        finalList = listForJson1 ++ listForJson2 ++ listForJson3 ++ List(selectString)
+        finalList = stringOutputEdges ++ listForJson1 ++ listForJson2 ++ listForJson3 ++ List(selectString)
         listDrop = List("DROP TABLE E_stage3") ++ stringOutput2._3.split("\n").toList ++ stringOutput1._2.split("\n").toList
         println("final " + finalList)
         println("dropping " + listDrop)
@@ -557,7 +567,7 @@ object QueryRewriter {
           println("new root: " + root + " b: " + root.edges.head.planReference.getRowType)
 
           // get the aggregate, which are applied at the end on the rerooted root
-          val stringAtt = aggAttributes.map{a => indexToName(a.asInstanceOf[RexInputRef])}
+          val stringAtt = aggAttributes.map { a => indexToName(a.asInstanceOf[RexInputRef]) }
           val allAgg: String = relNodeFiltered match {
             case aggregate: LogicalAggregate =>
               val namedAggCalls = aggregate.getNamedAggCalls.asScala
@@ -589,46 +599,20 @@ object QueryRewriter {
           table.trim
           val selectString = "SELECT * FROM " + table
 
-          val finalList = listForJsonAgg ++ List(selectString)
+          finalList = listForJsonAgg ++ List(selectString)
           // val finalList = listForJsonAgg ++ List(selectString) ++ listDrop
 
           // stop the time for the whole program in seconds and give it to the json
           val endTime = System.nanoTime()
           val executionTime = (endTime - startTime) / 1e9
 
-          /// for the column Date, we needed \\\"Date\\\" for this scala, but now we want Date again
-          val original = query.replace("\"Date\"", "Date")
-
-          // GET FEATURES OF THE JOIN TREE
-          // get the tree depth
-          var treeDepth = root.getTreeDepth(root,0)
-          println("depth: " + treeDepth)
-          // get the item lifetimes
-          var containerCounts = root.getContainerCount(hg.getEquivalenceClasses, attributes)
-          println("container counts: " + containerCounts)
-          // get the branching factor
-          var branchingFactors = root.getBranchingFactors(root)
-          println("branching factors: " + branchingFactors)
-          // get the balancedness factor
-          var balancednessFactors = root.getBalancednessFactors(root)
-          var balancednessFactor = balancednessFactors._2.sum / balancednessFactors._2.length
-          println("balancedness factor: " + balancednessFactors + "  " + balancednessFactor)
-          // save all features in one list
-          var features = List(treeDepth, containerCounts, branchingFactors, balancednessFactor).toString
-
-
-
-          // write a txt file with a visulization of the join tree
-          println(root.treeToString(0))
-          writeResults("jointree.txt", root.treeToString(0))
-
           // GET THE HYPERGRAPH REPRESENTATION
           var edgeStart = 0
           val edgeResult = ListBuffer[List[String]]()
           for (i <- items) {
             val edgeCount = i.getRowType().getFieldCount()
-            var edgeAtt = attributes.slice(edgeStart,edgeStart + edgeCount)
-            val edgeKeys = edgeAtt.map{ e =>
+            var edgeAtt = attributes.slice(edgeStart, edgeStart + edgeCount)
+            val edgeKeys = edgeAtt.map { e =>
               val keyString = root.edges.head.attributeToVertex.getOrElse(e, e).toString.tail
               keyString
             }
@@ -637,20 +621,41 @@ object QueryRewriter {
           }
           println("hypergraph representation: " + edgeStart + " " + edgeResult.toString)
           // write a txt file with the edges and the number of vertices of the hypergraph
-
-          // write a json file with the original and the rewritten query
-
-          val jsonOutput = JsonOutput(original, finalList, features, executionTime, true)
-          val json: String = write(jsonOutput)
-          writeResults("output.json", json.toString)
-
-          // write a file, which makes dropping the tables after creating them easy
-          val listDrop = stringOutput._2.split("\n").toList
-          val jsonOutputDrop = JsonOutput("", listDrop, "", 0, true)
-          val jsonDrop: String = write(jsonOutputDrop)
-          writeResults("drop.json", jsonDrop.toString)
         }
       }
+
+      // stop the time for the whole program in seconds and give it to the json
+      val endTime = System.nanoTime()
+      val executionTime = (endTime - startTime) / 1e9
+
+      /// for the column Date, we needed \\\"Date\\\" for this scala, but now we want Date again
+      val original = query.replace("\"Date\"", "Date")
+
+      // GET FEATURES OF THE JOIN TREE
+      // get the tree depth
+      var treeDepth = root.getTreeDepth(root, 0)
+      println("depth: " + treeDepth)
+      // get the item lifetimes
+      var containerCounts = root.getContainerCount(hg.getEquivalenceClasses, attributes)
+      println("container counts: " + containerCounts)
+      // get the branching factor
+      var branchingFactors = root.getBranchingFactors(root)
+      println("branching factors: " + branchingFactors)
+      // get the balancedness factor
+      var balancednessFactors = root.getBalancednessFactors(root)
+      var balancednessFactor = balancednessFactors._2.sum / balancednessFactors._2.length
+      println("balancedness factor: " + balancednessFactors + "  " + balancednessFactor)
+      // save all features in one list
+      var features = List(treeDepth, containerCounts, branchingFactors, balancednessFactor).toString
+
+      val jsonOutput = JsonOutput(original, finalList, features, executionTime, true)
+      val json: String = write(jsonOutput)
+      writeResults("output.json", json.toString)
+
+      // write a file, which makes dropping the tables after creating them easy
+      val jsonOutputDrop = JsonOutput("", listDrop, "", 0, true)
+      val jsonDrop: String = write(jsonOutputDrop)
+      writeResults("drop.json", jsonDrop.toString)
     }
   }
 

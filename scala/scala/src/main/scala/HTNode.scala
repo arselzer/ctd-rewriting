@@ -5,6 +5,7 @@ import org.apache.calcite.rex.{RexInputRef, RexNode}
 import org.apache.calcite.sql.dialect.Db2SqlDialect
 
 import scala.collection.IterableOnce.iterableOnceExtensionMethods
+import scala.jdk.CollectionConverters.CollectionHasAsScala
 
 class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNode){
   // For each vertex, select one edge in which an attribute it maps to is contained
@@ -101,7 +102,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       }
       result1 = result1.dropRight(5) + ")"
       resultString1 = resultString1 + result1 + "\n"
-      dropString1 = "DROP TABLE  IF EXISTS" + newName + "\n" + dropString1
+      dropString1 = "DROP TABLE  IF EXISTS " + newName + "\n" + dropString1
       println("DROP: " + dropString1)
       joinIndex += 1
       //edge.nameJoin = newName
@@ -154,7 +155,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
   // get the SQL statements of the bottom up joins
   def BottomUpJoin(indexToName: scala.collection.immutable.Map[RexInputRef, String], tablesString: String,
-                   conditionsString: String): (RelNode, String, String) = {
+                   conditionsString: String, projectionString: String, projectAttributes: Set[RexNode],
+                   root: Boolean): (RelNode, String, String, String) = {
     val edge = edges.head
     val scanPlan = edge.planReference
     val vertices = edge.vertices
@@ -162,16 +164,45 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
     var tables = tablesString
     var conditions = conditionsString
+    var projections = projectionString
+
+    if (root) {
+      tables = tables + edge.nameJoin + ", "
+
+      val planReferenceAttributes = edge.planReference.getRowType.getFieldList
+      val tableAttributes = planReferenceAttributes.asScala.map { case att =>
+        var index = att.getIndex + edge.attIndex
+        edge.attributes(index)
+      }.toSet
+      val projection = tableAttributes.intersect(projectAttributes).map { vertex =>
+        val att1 = edge.vertexToAttribute.getOrElse(vertex, vertex)
+        val att1_name = indexToName.getOrElse(att1.asInstanceOf[RexInputRef], "")
+        edge.nameJoin + "."  + edge.name + "_" + att1_name + " AS " + edge.name + "_" + att1_name
+      }.mkString(", ")
+      projections = projections + projection + (if (projection.nonEmpty) ", " else "")
+    }
 
     // create joins with all children
     for (c <- children) {
       val childEdge = c.edges.head
       tables = tables + childEdge.nameJoin + ", "
 
+      val planReferenceAttributes = childEdge.planReference.getRowType.getFieldList
+      val tableAttributes = planReferenceAttributes.asScala.map { case att =>
+        var index = att.getIndex + childEdge.attIndex
+        childEdge.attributes(index)
+      }.toSet
+      val projection = tableAttributes.intersect(projectAttributes).map { vertex =>
+        val att1 = childEdge.vertexToAttribute.getOrElse(vertex, vertex)
+        val att1_name = indexToName.getOrElse(att1.asInstanceOf[RexInputRef], "")
+        childEdge.nameJoin + "." + childEdge.name + "_" + att1_name + " AS " + childEdge.name + "_" + att1_name
+      }.mkString(", ")
+      projections = projections + projection + (if (projection.nonEmpty) ", " else "")
+
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices.intersect(childVertices)
 
-      val cStringOutput = c.BottomUpJoin(indexToName, tables, conditions)
+      val cStringOutput = c.BottomUpJoin(indexToName, tables, conditions, projections, projectAttributes, false)
       conditions = cStringOutput._3
       tables = cStringOutput._2
 
@@ -184,7 +215,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
           "=" + childEdge.nameJoin + "." + childEdge.nameJoin.split("_")(0) + "_" + att2_name + " AND "
       }
     }
-    (prevJoin, tables, conditions)
+    (prevJoin, tables, conditions, projections)
   }
 
   // define a given root as the new root of the tree
