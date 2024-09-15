@@ -63,6 +63,26 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     edges.map(e => e.name).toList.sorted.mkString("")
   }
 
+  // Used for cost estimation of semi-joins between any (edge) nodes
+  def getSemijoinWith(other: HTNode, indexToName: scala.collection.immutable.Map[RexInputRef, String]): String = {
+    val vertices = edges.flatMap(e => e.vertices)
+    val otherVertices = other.edges.flatMap(e => e.vertices)
+    val overlappingVertices = vertices.intersect(otherVertices)
+
+    val lastName = getIdentifier()
+    val otherIdentifier = other.getIdentifier()
+
+    val sjConditions = overlappingVertices.map { vertex =>
+      val att1Name = vertexName(vertex, indexToName)
+      val att2Name = other.vertexName(vertex, indexToName)
+      lastName + "." + att1Name +
+        "=" + otherIdentifier + "." + att2Name
+    }.mkString(" AND ")
+
+    val result = f"SELECT * FROM $lastName WHERE EXISTS (SELECT 1 FROM $otherIdentifier WHERE $sjConditions)"
+    result
+  }
+
   // get the SQL statements of the bottom up traversal
   def BottomUp(indexToName: scala.collection.immutable.Map[RexInputRef, String], resultString: String,
                dropString: String, projectJoinAttributes: Set[RexNode]): (String, String) = {
@@ -92,15 +112,14 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val childIdentifier = if (c.children.nonEmpty) f"${c.getIdentifier}_stage1_final" else c.getIdentifier()
       var result1 = "CREATE UNLOGGED TABLE " + newName + " AS SELECT * FROM " + lastName +
         " WHERE EXISTS (SELECT 1 FROM " + childIdentifier + " WHERE "
-      overlappingVertices.foreach { vertex =>
+
+      val sjConditions = overlappingVertices.map { vertex =>
         val att1Name = vertexName(vertex, indexToName)
         val att2Name = c.vertexName(vertex, indexToName)
-//        result1 = result1 + getIdentifier() + "." + edge.nameJoin.split("_")(0) + "_" + att1_name +
-//          "=" + c.getIdentifier() + "." + childEdge.nameJoin.split("_")(0) + "_" + att2_name + " AND "
-        result1 = result1 + lastName + "." + att1Name +
-          "=" + childIdentifier + "." + att2Name + " AND "
-      }
-      result1 = result1.dropRight(5) + ")"
+
+        lastName + "." + att1Name + "=" + childIdentifier + "." + att2Name
+      }.mkString(" AND ")
+      result1 = result1 + sjConditions + ")"
       resultString1 = resultString1 + result1 + "\n"
       dropString1 = "DROP TABLE  IF EXISTS " + newName + "\n" + dropString1
       println("DROP: " + dropString1)

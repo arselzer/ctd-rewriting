@@ -244,6 +244,90 @@ object QueryRewriter {
     upickle.default.write(determineNodeWeights(candidateNodes))
   }
 
+  def determineSemijoinWeights(semijoins: List[(List[String], List[String])]): List[(List[String], List[String], String)] = {
+    val (stringOutputEdges, dropListEdges) = createEdgeViews(projectJoinAttributes)
+
+    //print("Creating edge views")
+    stringOutputEdges.foreach(createStr => {
+      val stmt = pgConnection.createStatement()
+      stmt.executeUpdate(createStr)
+      stmt.close()
+    })
+
+    var viewNames: List[String] = List()
+
+    // Create unique cover views
+    val distinctCovers = semijoins.flatMap(sjs => {
+      List(sjs._1, sjs._2)
+    })
+      .map(sj => {
+        (sj.sorted.mkString(""), sj)
+      })
+      .toMap.values
+
+    //println("Creating cover views")
+
+    distinctCovers.foreach(cover => {
+      if (cover.length > 1) {
+        val stmt = pgConnection.createStatement()
+
+        val edges = hg.edges.filter(e => cover contains e.name).toSet
+        val node = new HTNode(edges, Set(), null)
+        val createViewStr = node.getCoverJoin(indexToName)._1
+        viewNames = viewNames ++ List(node.getIdentifier())
+
+        stmt.executeUpdate(createViewStr)
+        stmt.close()
+      }
+    })
+
+    //println("Estimating semijoin costs")
+
+    val sjWeights = semijoins.grouped(Math.max(1, semijoins.size / Runtime.getRuntime.availableProcessors())).toList.par
+      .flatMap(semijoinsSplit => {
+        val conn = ds.getConnection
+
+        val output = semijoinsSplit.map(sj => {
+          val fromNode = sj._1
+          val toNode = sj._2
+          val edgesFrom = hg.edges.filter(e => fromNode contains e.name).toSet
+          val nodeFrom = new HTNode(edgesFrom, Set(), null)
+          val edgesTo = hg.edges.filter(e => toNode contains e.name).toSet
+          val nodeTo = new HTNode(edgesTo, Set(), null)
+
+          //println("Estimating semijoin cost from", nodeFrom.getIdentifier(), " to ", nodeTo.getIdentifier())
+
+          val stmt = conn.createStatement()
+          val sjStr = nodeTo.getSemijoinWith(nodeFrom, indexToName)
+          //println(sjStr)
+          val rs = stmt.executeQuery(f"EXPLAIN (FORMAT JSON) $sjStr")
+
+          var jsonOutput = ""
+
+          while (rs.next()) {
+            jsonOutput = jsonOutput + rs.getString(1)
+          }
+          (sj._1, sj._2, jsonOutput)
+        })
+        conn.close()
+        output
+      })
+
+    val stmt = pgConnection.createStatement()
+    val viewsStr = viewNames.reverse.mkString(", ")
+    stmt.executeUpdate(f"DROP VIEW $viewsStr CASCADE;")
+    stmt.close()
+
+    sjWeights.toList
+  }
+
+  def determineSemijoinWeightsJSON(semijoinsStr: String): String = {
+    val semijoins = upickle.default.read[List[(List[String], List[String])]](semijoinsStr)
+
+
+    upickle.default.write(determineSemijoinWeights(semijoins))
+  }
+
   def rewriteCyclicJSON(hdJSON: String): String = {
     val ht = hdStringToHTNode(hdJSON)
     ht.setParentReferences
@@ -313,19 +397,17 @@ object QueryRewriter {
     else {
       val findNodeContainingAttributes = root.findNodeContainingAttributes(aggAttributes)
       val nodeContainingAttributes = findNodeContainingAttributes._1
-      println("nodeContaining: " + nodeContainingAttributes)
       //aggAttributes = findNodeContainingAttributes._2
       //println("aggAttofRoot: " + aggAttributes)
 
       if (nodeContainingAttributes == null) {
         println("attributes are not contained in only one node")
+        // TODO use enumeration
       }
       else {
-        println("one node contains all attributes")
-
         // reroot the tree, such that the root contains all attributes
         root = nodeContainingAttributes.reroot
-        println("new root: " + root + " b: " + root.edges.head.planReference.getRowType)
+        //println("new root: " + root + " b: " + root.edges.head.planReference.getRowType)
 
         // get the aggregate, which are applied at the end on the rerooted root
         val stringAtt = aggAttributes.map{a => root.vertexName(a.asInstanceOf[RexInputRef], indexToName)}
@@ -378,7 +460,7 @@ object QueryRewriter {
         }
 
         // write a txt file with a visulization of the join tree
-        println(root.treeToString(0))
+        //println(root.treeToString(0))
         writeResults("jointree.txt", root.treeToString(0))
 
         finalList = stringOutputEdges ++ stringOutputCover ++ listForJsonAgg ++ List(selectString)
@@ -396,17 +478,14 @@ object QueryRewriter {
       // GET FEATURES OF THE JOIN TREE
       // get the tree depth
       var treeDepth = root.getTreeDepth(root,0)
-      println("depth: " + treeDepth)
       // get the item lifetimes
       var containerCounts = root.getContainerCount(hg.getEquivalenceClasses, attributes)
-      println("container counts: " + containerCounts)
+
       // get the branching factor
       var branchingFactors = root.getBranchingFactors(root)
-      println("branching factors: " + branchingFactors)
       // get the balancedness factor
       var balancednessFactors = root.getBalancednessFactors(root)
       var balancednessFactor = balancednessFactors._2.sum / balancednessFactors._2.length
-      println("balancedness factor: " + balancednessFactors + "  " + balancednessFactor)
       // save all features in one list
       var features = List(treeDepth, containerCounts, branchingFactors, balancednessFactor).toString
 
